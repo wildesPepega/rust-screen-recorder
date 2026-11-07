@@ -61,6 +61,19 @@ pub struct Status {
     pub has_last_clip: bool,
     #[serde(default)]
     pub last_link: String,
+    /// Running FireShare upload (file name), its progress 0..1, bytes and the queue length.
+    #[serde(default)]
+    pub upload_name: String,
+    #[serde(default)]
+    pub upload_progress: f32,
+    #[serde(default)]
+    pub upload_sent: u64,
+    #[serde(default)]
+    pub upload_total: u64,
+    #[serde(default)]
+    pub upload_phase: u8,
+    #[serde(default)]
+    pub upload_queue: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

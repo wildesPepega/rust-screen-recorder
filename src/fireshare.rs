@@ -13,7 +13,44 @@ use crate::config::FireshareSettings;
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Live upload progress, shared with the daemon (toast + overlay progress bar).
+#[derive(Default)]
+pub struct Progress {
+    pub sent: AtomicU64,
+    pub total: AtomicU64,
+    /// 0 = preparing (checking token / converting), 1 = uploading, 2 = finishing.
+    pub phase: AtomicU8,
+}
+
+impl Progress {
+    pub fn fraction(&self) -> f32 {
+        let t = self.total.load(Ordering::Relaxed);
+        if t == 0 {
+            0.0
+        } else {
+            (self.sent.load(Ordering::Relaxed) as f64 / t as f64).clamp(0.0, 1.0) as f32
+        }
+    }
+}
+
+/// Reader that reports how many bytes reqwest has pulled from the chunk.
+struct ProgressReader {
+    data: std::io::Cursor<Vec<u8>>,
+    base: u64,
+    prog: Arc<Progress>,
+}
+
+impl Read for ProgressReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.data.read(buf)?;
+        self.prog.sent.store(self.base + self.data.position(), Ordering::Relaxed);
+        Ok(n)
+    }
+}
 
 const CHUNK: usize = 8 * 1024 * 1024;
 const SUPPORTED: [&str; 4] = ["mp4", "m4v", "mov", "webm"];
@@ -110,32 +147,33 @@ fn ensure_supported(path: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
 }
 
 /// Upload a clip. `game` links it to a game in FireShare's library (if that game exists there).
-pub fn upload(cfg: &FireshareSettings, path: &Path, title: &str, game: Option<&str>) -> Result<Uploaded> {
+pub fn upload(cfg: &FireshareSettings, path: &Path, title: &str, game: Option<&str>, prog: Arc<Progress>) -> Result<Uploaded> {
+    prog.phase.store(0, Ordering::Relaxed);
     let b = base(cfg)?;
     // Validate the token first: a server rejecting a large multipart body early only shows up
     // as a broken connection, this gives a clear error instead.
     check(cfg)?;
     let (file, tmp) = ensure_supported(path)?;
-    let r = upload_inner(cfg, &b, &file, title, game);
+    let r = upload_inner(cfg, &b, &file, title, game, &prog);
     if let Some(t) = tmp {
         let _ = std::fs::remove_file(t);
     }
     r
 }
 
-fn upload_inner(cfg: &FireshareSettings, b: &str, file: &Path, title: &str, game: Option<&str>) -> Result<Uploaded> {
+fn upload_inner(cfg: &FireshareSettings, b: &str, file: &Path, title: &str, game: Option<&str>, prog: &Arc<Progress>) -> Result<Uploaded> {
     let id = video_id(file)?;
     let url = format!("{b}/watch/{id}");
     let game = if cfg.link_game { game.filter(|g| !g.trim().is_empty()) } else { None };
     let folder = if cfg.folder_per_game { game.map(|g| g.to_string()) } else { None }
         .or_else(|| Some(cfg.folder.trim().to_string()).filter(|f| !f.is_empty()));
 
-    match send_chunks(cfg, b, file, title, game, folder.as_deref()) {
+    match send_chunks(cfg, b, file, title, game, folder.as_deref(), prog) {
         Ok(dup) => Ok(Uploaded { url, duplicate: dup }),
         // FireShare rejects game names it does not know (400) – upload without the game link.
         Err(UploadError::UnknownGame) if game.is_some() => {
             log::info!("FireShare does not know the game {game:?} – uploading without game link");
-            let dup = send_chunks(cfg, b, file, title, None, folder.as_deref()).map_err(|e| anyhow!("{e}"))?;
+            let dup = send_chunks(cfg, b, file, title, None, folder.as_deref(), prog).map_err(|e| anyhow!("{e}"))?;
             Ok(Uploaded { url, duplicate: dup })
         }
         Err(e) => Err(anyhow!("{e}")),
@@ -158,7 +196,15 @@ impl std::fmt::Display for UploadError {
 }
 
 /// Returns Ok(duplicate).
-fn send_chunks(cfg: &FireshareSettings, b: &str, file: &Path, title: &str, game: Option<&str>, folder: Option<&str>) -> Result<bool, UploadError> {
+fn send_chunks(
+    cfg: &FireshareSettings,
+    b: &str,
+    file: &Path,
+    title: &str,
+    game: Option<&str>,
+    folder: Option<&str>,
+    prog: &Arc<Progress>,
+) -> Result<bool, UploadError> {
     let e = |m: String| UploadError::Other(m);
     let http = client().map_err(|x| e(x.to_string()))?;
     let size = std::fs::metadata(file).map_err(|x| e(x.to_string()))?.len() as usize;
@@ -168,10 +214,20 @@ fn send_chunks(cfg: &FireshareSettings, b: &str, file: &Path, title: &str, game:
     let check_sum = format!("rsr{}{}", std::process::id(), chrono::Local::now().format("%Y%m%d%H%M%S%3f"));
     let mut f = std::fs::File::open(file).map_err(|x| e(x.to_string()))?;
     let mut buf = vec![0u8; CHUNK];
+    prog.total.store(size as u64, Ordering::Relaxed);
+    prog.sent.store(0, Ordering::Relaxed);
+    prog.phase.store(1, Ordering::Relaxed);
+    let mut offset: u64 = 0;
 
     for part in 1..=total {
         let n = read_full(&mut f, &mut buf).map_err(|x| e(x.to_string()))?;
-        let blob = reqwest::blocking::multipart::Part::bytes(buf[..n].to_vec())
+        let reader = ProgressReader { data: std::io::Cursor::new(buf[..n].to_vec()), base: offset, prog: prog.clone() };
+        offset += n as u64;
+        if part == total {
+            // Last chunk: FireShare reassembles and scans once it is complete.
+            prog.phase.store(1, Ordering::Relaxed);
+        }
+        let blob = reqwest::blocking::multipart::Part::reader_with_length(reader, n as u64)
             .file_name(name.clone())
             .mime_str("application/octet-stream")
             .map_err(|x| e(x.to_string()))?;
@@ -198,6 +254,10 @@ fn send_chunks(cfg: &FireshareSettings, b: &str, file: &Path, title: &str, game:
             .map_err(|x| e(format!("upload failed: {x}")))?;
         let status = r.status().as_u16();
         let body = r.text().unwrap_or_default();
+        prog.sent.store(offset, Ordering::Relaxed);
+        if part == total {
+            prog.phase.store(2, Ordering::Relaxed);
+        }
         match status {
             202 if part < total => continue,
             201 => return Ok(false),

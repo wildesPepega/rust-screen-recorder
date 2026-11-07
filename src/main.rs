@@ -190,7 +190,28 @@ fn main() {
                 let cfg = config::Config::load();
                 let path = std::path::PathBuf::from(file);
                 let title = path.file_stem().map(|s| s.to_string_lossy().replace('_', " ")).unwrap_or_default();
-                fireshare::upload(&cfg.fireshare, &path, &title, args.get(2).map(|s| s.as_str())).map(|u| {
+                let prog = std::sync::Arc::new(fireshare::Progress::default());
+                let p2 = prog.clone();
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let d2 = done.clone();
+                let printer = std::thread::spawn(move || {
+                    use std::io::Write;
+                    while !d2.load(std::sync::atomic::Ordering::Relaxed) {
+                        let t = p2.total.load(std::sync::atomic::Ordering::Relaxed);
+                        if t > 0 {
+                            let f = p2.fraction();
+                            let bar: String = (0..30).map(|i| if (i as f32) < f * 30.0 { '#' } else { '-' }).collect();
+                            eprint!("\r[{bar}] {:>3.0}%  {:.1}/{:.1} MB ", f * 100.0, p2.sent.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, t as f64 / 1e6);
+                            let _ = std::io::stderr().flush();
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                });
+                let r = fireshare::upload(&cfg.fireshare, &path, &title, args.get(2).map(|s| s.as_str()), prog);
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = printer.join();
+                eprintln!();
+                r.map(|u| {
                     println!("{}{}", u.url, if u.duplicate { "  (already on FireShare)" } else { "" });
                 })
             }

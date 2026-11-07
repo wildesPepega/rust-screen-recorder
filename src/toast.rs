@@ -28,6 +28,8 @@ pub enum ToastKind {
     Info,
     /// Orange – something went wrong.
     Error,
+    /// Blue – upload in progress.
+    Upload,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +37,8 @@ pub struct Toast {
     pub kind: ToastKind,
     pub title: String,
     pub body: String,
+    /// Some(0..1) draws a progress bar; the toast stays visible while updates keep coming.
+    pub progress: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -64,7 +68,12 @@ impl Toaster {
     }
 
     pub fn show(&self, kind: ToastKind, title: impl Into<String>, body: impl Into<String>) {
-        let _ = self.tx.send(Toast { kind, title: title.into(), body: body.into() });
+        let _ = self.tx.send(Toast { kind, title: title.into(), body: body.into(), progress: None });
+    }
+
+    /// Show / update a toast with a progress bar (call repeatedly; same toast is updated in place).
+    pub fn show_progress(&self, kind: ToastKind, title: impl Into<String>, body: impl Into<String>, progress: f32) {
+        let _ = self.tx.send(Toast { kind, title: title.into(), body: body.into(), progress: Some(progress.clamp(0.0, 1.0)) });
     }
 }
 
@@ -152,6 +161,7 @@ fn render(t: &Toast, fonts: &Fonts, alpha: f32) -> Vec<u8> {
         ToastKind::Record => (0xff, 0x4d, 0x4f),
         ToastKind::Info => (0x9a, 0xa0, 0xab),
         ToastKind::Error => (0xff, 0xa5, 0x2e),
+        ToastKind::Upload => (0x4d, 0xa3, 0xff),
     };
     // card
     let r = 14.0;
@@ -198,13 +208,39 @@ fn render(t: &Toast, fonts: &Fonts, alpha: f32) -> Vec<u8> {
             pb.push_circle(36.0, cy, 6.0);
             pm.fill_path(&pb.finish().unwrap(), &ip, FillRule::Winding, Transform::identity(), None);
         }
+        ToastKind::Upload => {
+            // upward arrow
+            let mut pb = PathBuilder::new();
+            pb.move_to(36.0, cy - 7.0);
+            pb.line_to(36.0, cy + 7.0);
+            pb.move_to(30.5, cy - 1.5);
+            pb.line_to(36.0, cy - 7.0);
+            pb.line_to(41.5, cy - 1.5);
+            let stroke = tiny_skia::Stroke { width: 2.6, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+            pm.stroke_path(&pb.finish().unwrap(), &ip, &stroke, Transform::identity(), None);
+        }
         ToastKind::Info | ToastKind::Error => {
             let txt = if t.kind == ToastKind::Info { "i" } else { "!" };
             draw_text(&mut pm, &fonts.bold, 18.0, 33.5, cy + 6.5, 20.0, txt, (0x10, 0x12, 0x16), alpha);
         }
     }
     draw_text(&mut pm, &fonts.bold, 18.0, 64.0, 38.0, w - 80.0, &t.title, (0xf2, 0xf3, 0xf5), alpha);
-    draw_text(&mut pm, &fonts.regular, 14.0, 64.0, 62.0, w - 80.0, &t.body, (0xa8, 0xae, 0xb8), alpha);
+    let body_y = if t.progress.is_some() { 58.0 } else { 62.0 };
+    draw_text(&mut pm, &fonts.regular, 14.0, 64.0, body_y, w - 80.0, &t.body, (0xa8, 0xae, 0xb8), alpha);
+    if let Some(p) = t.progress {
+        // progress track + fill
+        let (bx, by, bw, bh) = (64.0, h - 20.0, w - 88.0, 6.0);
+        let mut tp = Paint::default();
+        tp.anti_alias = true;
+        tp.set_color(Color::from_rgba8(255, 255, 255, (38.0 * alpha) as u8));
+        let mut track = PathBuilder::new();
+        track.push_rect(Rect::from_xywh(bx, by, bw, bh).unwrap());
+        pm.fill_path(&track.finish().unwrap(), &tp, FillRule::Winding, Transform::identity(), None);
+        if p > 0.0 {
+            tp.set_color(Color::from_rgba8(accent.0, accent.1, accent.2, (255.0 * alpha) as u8));
+            pm.fill_rect(Rect::from_xywh(bx, by, (bw * p).max(2.0), bh).unwrap(), &tp, Transform::identity(), None);
+        }
+    }
     // tiny-skia: premultiplied RGBA → wl_shm ARGB8888 (little endian BGRA)
     let mut out = pm.take();
     for px in out.chunks_exact_mut(4) {
@@ -401,3 +437,31 @@ ignore!(
     wl_region::WlRegion,
     zwlr_layer_shell_v1::ZwlrLayerShellV1
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// RSR_TOAST_PREVIEW=/path/dir cargo test toast_preview -- renders sample toasts as PNG.
+    #[test]
+    fn toast_preview() {
+        let Some(dir) = std::env::var_os("RSR_TOAST_PREVIEW") else { return };
+        let fonts = Fonts::load().unwrap();
+        let p = crate::fireshare::Progress::default();
+        p.total.store(28_375_511, std::sync::atomic::Ordering::Relaxed);
+        p.sent.store(11_800_000, std::sync::atomic::Ordering::Relaxed);
+        p.phase.store(1, std::sync::atomic::Ordering::Relaxed);
+        let (title, body) = crate::daemon::progress_text(&p, "clip.mp4", 3.8, 2);
+        let samples = [
+            ("upload", Toast { kind: ToastKind::Upload, title, body, progress: Some(p.fraction()) }),
+            ("done", Toast { kind: ToastKind::Success, title: "Uploaded to FireShare".into(), body: "Link copied · https://clips.example.com/watch/ef03ff6f…".into(), progress: None }),
+        ];
+        for (name, t) in samples {
+            let mut px = render(&t, &fonts, 1.0);
+            for c in px.chunks_exact_mut(4) {
+                c.swap(0, 2);
+            }
+            let pm = tiny_skia::Pixmap::from_vec(px, tiny_skia::IntSize::from_wh(W, H).unwrap()).unwrap();
+            pm.save_png(std::path::Path::new(&dir).join(format!("toast_{name}.png"))).unwrap();
+        }
+    }
+}

@@ -98,7 +98,7 @@ fn tile(ui: &mut egui::Ui, title: &str, icon: &str, add: impl FnOnce(&mut egui::
         .inner_margin(egui::Margin::same(20))
         .show(ui, |ui| {
             ui.set_width(TILE_W - 40.0);
-            ui.set_min_height(330.0);
+            ui.set_min_height(370.0);
             ui.vertical(|ui| {
                 ui.label(RichText::new(icon).size(30.0));
                 ui.label(RichText::new(title).size(20.0).strong());
@@ -148,11 +148,31 @@ impl Overlay {
                 if wide_button(ui, "Open clips folder") {
                     super::open_folder(&crate::config::expand_path(&self.cfg.replay.output_dir));
                 }
+                if st.fireshare_enabled && st.uploading {
+                    let (label, frac) = match st.upload_phase {
+                        0 => ("Preparing…".to_string(), 0.0),
+                        2 => ("Finishing…".to_string(), 1.0),
+                        _ => (
+                            format!("{:.0} %  ·  {:.1} / {:.1} MB", st.upload_progress * 100.0, st.upload_sent as f64 / 1e6, st.upload_total as f64 / 1e6),
+                            st.upload_progress,
+                        ),
+                    };
+                    ui.label(RichText::new(format!("⇪ {}", st.upload_name)).small().color(TEXT_DIM));
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(TILE_W - 40.0)
+                            .fill(Color32::from_rgb(0x4d, 0xa3, 0xff))
+                            .text(RichText::new(label).small())
+                            .animate(st.upload_phase != 1),
+                    );
+                    if st.upload_queue > 0 {
+                        ui.label(RichText::new(format!("+{} more queued", st.upload_queue)).small().color(TEXT_DIM));
+                    }
+                }
                 if st.fireshare_enabled {
                     ui.horizontal(|ui| {
-                        let label = if st.uploading { "Uploading…" } else { "⇪ Upload last clip" };
-                        let b = egui::Button::new(label).min_size(Vec2::new((TILE_W - 48.0) / 2.0, 30.0));
-                        if ui.add_enabled(st.has_last_clip && !st.uploading, b).on_hover_text("Upload to FireShare").clicked() {
+                        let b = egui::Button::new("⇪ Upload last clip").min_size(Vec2::new((TILE_W - 48.0) / 2.0, 30.0));
+                        if ui.add_enabled(st.has_last_clip, b).on_hover_text("Upload to FireShare (queued if an upload is running)").clicked() {
                             send_async(Request::UploadLastClip);
                         }
                         let b = egui::Button::new("Copy link").min_size(Vec2::new((TILE_W - 48.0) / 2.0, 30.0));
