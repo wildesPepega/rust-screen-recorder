@@ -6,8 +6,24 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-pub const BUS_NAME: &str = "org.rustscreenrecorder.Daemon";
-pub const SCRIPT_NAME: &str = "rust-screen-recorder-windows";
+/// Optional instance name (RSR_INSTANCE) – lets a second, isolated daemon run for testing.
+pub fn instance() -> Option<String> {
+    std::env::var("RSR_INSTANCE").ok().filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+pub fn bus_name() -> String {
+    match instance() {
+        Some(i) => format!("org.rustscreenrecorder.Daemon_{i}"),
+        None => "org.rustscreenrecorder.Daemon".into(),
+    }
+}
+
+pub fn script_name() -> String {
+    match instance() {
+        Some(i) => format!("rust-screen-recorder-windows-{i}"),
+        None => "rust-screen-recorder-windows".into(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct WindowInfo {
@@ -63,7 +79,7 @@ function push() {
         list.push(info(w));
     }
     var a = workspace.activeWindow;
-    callDBus("org.rustscreenrecorder.Daemon", "/KWin", "org.rustscreenrecorder.KWin", "Update",
+    callDBus("@BUS_NAME@", "/KWin", "org.rustscreenrecorder.KWin", "Update",
              JSON.stringify(list), a ? a.internalId.toString() : "");
 }
 function setupOverlay(w) {
@@ -115,8 +131,8 @@ impl KwinSink {
 pub async fn load_script(conn: &zbus::Connection) -> Result<()> {
     let dir = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir).join("rust-screen-recorder");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join("kwin-windows.js");
-    std::fs::write(&path, SCRIPT)?;
+    let path = dir.join(format!("{}.js", script_name()));
+    std::fs::write(&path, SCRIPT.replace("@BUS_NAME@", &bus_name()))?;
     let _ = unload_script(conn).await;
     let reply = conn
         .call_method(
@@ -124,7 +140,7 @@ pub async fn load_script(conn: &zbus::Connection) -> Result<()> {
             "/Scripting",
             Some("org.kde.kwin.Scripting"),
             "loadScript",
-            &(path.to_string_lossy().to_string(), SCRIPT_NAME),
+            &(path.to_string_lossy().to_string(), script_name()),
         )
         .await?;
     let id: i32 = reply.body().deserialize()?;
@@ -148,7 +164,7 @@ pub async fn load_script(conn: &zbus::Connection) -> Result<()> {
 }
 
 pub async fn unload_script(conn: &zbus::Connection) -> Result<()> {
-    conn.call_method(Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), "unloadScript", &(SCRIPT_NAME,))
+    conn.call_method(Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), "unloadScript", &(script_name(),))
         .await?;
     Ok(())
 }

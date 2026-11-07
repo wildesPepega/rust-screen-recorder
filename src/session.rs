@@ -54,6 +54,7 @@ impl EncoderSession {
         audio: &AudioSettings,
         available: &[(Codec, Backend)],
         out: Output,
+        overlays: Option<Arc<crate::overlays::OverlayHub>>,
     ) -> Result<EncoderSession> {
         let first = src
             .get()
@@ -123,12 +124,12 @@ impl EncoderSession {
         let fps_n = video.fps.max(1);
         let writer = if gpu {
             let (ow, oh) = encoders::output_size(base_w, base_h, video.width, video.height);
-            let enc = crate::gpu::GpuEncoder::new(video, ow, oh, Box::new(stdin));
+            let enc = crate::gpu::GpuEncoder::new(video, ow, oh, Box::new(stdin), overlays);
             std::thread::Builder::new().name(format!("gpu-enc-{name}")).spawn(move || gpu_loop(enc, src, fps_n, st2))?
         } else {
             std::thread::Builder::new()
                 .name(format!("writer-{name}"))
-                .spawn(move || writer_loop(stdin, src, input, fps_n, st2))?
+                .spawn(move || writer_loop(stdin, src, input, fps_n, st2, overlays))?
         };
 
         Ok(EncoderSession {
@@ -217,18 +218,36 @@ fn gpu_loop(mut enc: crate::gpu::GpuEncoder, src: Arc<Source>, fps: u32, stop: A
     enc.finish();
 }
 
-fn writer_loop(mut stdin: ChildStdin, src: Arc<Source>, input: RawInput, fps: u32, stop: Arc<AtomicBool>) {
+fn writer_loop(
+    mut stdin: ChildStdin,
+    src: Arc<Source>,
+    input: RawInput,
+    fps: u32,
+    stop: Arc<AtomicBool>,
+    overlays: Option<Arc<crate::overlays::OverlayHub>>,
+) {
     let mut scratch: Vec<u8> = Vec::new();
+    let mut composed: Vec<u8> = Vec::new();
     let mut last_nv12: Vec<u8> = Vec::new();
     pace(fps, &stop, &src, |frame| {
         let buf: &[u8] = match &frame.data {
             FrameData::Cpu(data) => {
-                if frame.width == input.width && frame.height == input.height {
+                let base: &[u8] = if frame.width == input.width && frame.height == input.height {
                     data
                 } else {
                     // The window was resized: letterbox into the fixed encoder size.
                     fit_into(frame, data, input.width, input.height, &mut scratch);
                     &scratch
+                };
+                // Software compositing of the video overlays (CPU path).
+                let layers = overlays.as_ref().map(|h| h.layers()).unwrap_or_default();
+                if layers.is_empty() {
+                    base
+                } else {
+                    composed.clear();
+                    composed.extend_from_slice(base);
+                    crate::overlays::blend_cpu(&mut composed, input.width, input.height, &layers);
+                    &composed
                 }
             }
             FrameData::Gpu(hw) => {
@@ -336,11 +355,12 @@ impl ReplaySession {
         available: &[(Codec, Backend)],
         dir: PathBuf,
         duration_secs: u32,
+        overlays: Option<Arc<crate::overlays::OverlayHub>>,
     ) -> Result<ReplaySession> {
         let mut v = video.clone();
         // Segments must start on keyframes.
         v.keyframe_interval_secs = v.keyframe_interval_secs.min(SEGMENT_SECS);
-        let enc = EncoderSession::spawn("replay", src, size_hint, &v, audio, available, Output::Segments { dir: dir.clone(), seg_secs: SEGMENT_SECS })?;
+        let enc = EncoderSession::spawn("replay", src, size_hint, &v, audio, available, Output::Segments { dir: dir.clone(), seg_secs: SEGMENT_SECS }, overlays)?;
         let track_titles = if audio.merge && audio.devices.len() > 1 {
             vec!["Mixed audio".into()]
         } else {

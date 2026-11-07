@@ -49,6 +49,17 @@ ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (
     shown as a progress bar in the overlay's Replay tile; the CLI shows a text progress bar.
     Several clips are queued and uploaded one after another.
   - In the overlay: *Upload last clip* / *Copy link*. CLI: `rust-screen-recorder upload <file> [game]`.
+- **Video overlays** (*Global Settings → Overlay*): a 16:9 monitor preview with one slot per
+  corner. Overlays are burned into recordings and clips, composited on the GPU in the zero-copy
+  path and in software on the CPU path. Size, opacity and edge distance are set per corner.
+  - **Keyboard & mouse:** the whole keyboard or the gaming half (Esc–5/T/G/B, modifiers,
+    space), with DE/US labels. A mouse next to it shows left, right and middle click, scroll
+    up/down and both side buttons. On Wayland this reads `/dev/input`, which needs the `input`
+    group: run `sudo usermod -aG input $USER` once and log in again.
+  - **Webcam:** any V4L2 camera, optionally mirrored.
+  - **Website:** any URL (alerts, chat, widgets), rendered by a headless Chromium-based browser
+    (Chromium, Chrome, Brave, Edge, Vivaldi) with a transparent background. An editor shows the
+    page; drag with the mouse to cut out the part that should be visible.
 - **In-game notifications:** Instant Replay on/off, clip saved (with the real clip length),
   recording started/saved and game detected. They are drawn on a layer-shell overlay surface above
   fullscreen games, never take focus and let clicks through.

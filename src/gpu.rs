@@ -464,9 +464,13 @@ pub struct GpuEncoder {
     out_w: u32,
     out_h: u32,
     graph: Option<Graph>,
-    graph_key: (u32, u32, usize),
+    graph_key: (u32, u32, usize, Vec<OverlayGeom>),
     /// Black background for letterboxing (None when the aspect ratio matches).
     bg: Option<HwFrame>,
+    /// Video overlays (input display, webcam, websites).
+    overlays: Option<std::sync::Arc<crate::overlays::OverlayHub>>,
+    /// Uploaded overlay surfaces, by corner: (content version, surface).
+    ov_cache: std::collections::HashMap<crate::config::Corner, (u64, OverlaySurface)>,
     enc: *mut AVCodecContext,
     oc: *mut AVFormatContext,
     stream: *mut AVStream,
@@ -477,6 +481,86 @@ pub struct GpuEncoder {
 }
 
 unsafe impl Send for GpuEncoder {}
+
+/// Geometry of one overlay inside the encoder graph (changes require a graph rebuild).
+#[derive(Clone, PartialEq, Debug)]
+struct OverlayGeom {
+    corner: crate::config::Corner,
+    img_w: u32,
+    img_h: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    alpha_milli: u32,
+}
+
+/// BGRA VA surface holding one overlay image.
+struct OverlaySurface {
+    frames: *mut AVBufferRef,
+    frame: HwFrame,
+    w: u32,
+    h: u32,
+}
+
+impl Drop for OverlaySurface {
+    fn drop(&mut self) {
+        unsafe { av_buffer_unref(&mut self.frames) }
+    }
+}
+
+/// Upload a straight-alpha BGRA image into a VA surface on the device of `like`.
+unsafe fn upload_bgra(like: *mut AVBufferRef, img: &crate::overlays::Image, reuse: Option<OverlaySurface>) -> Result<OverlaySurface> {
+    let frames = match reuse {
+        Some(mut r) if r.w == img.w && r.h == img.h => {
+            let f = r.frames;
+            r.frames = av_buffer_ref(f);
+            f
+        }
+        _ => {
+            let src_fc = (*like).data as *mut AVHWFramesContext;
+            let fr = av_hwframe_ctx_alloc((*src_fc).device_ref);
+            let fc = (*fr).data as *mut AVHWFramesContext;
+            (*fc).format = AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*fc).sw_format = AVPixelFormat::AV_PIX_FMT_BGRA;
+            (*fc).width = img.w as c_int;
+            (*fc).height = img.h as c_int;
+            let mut fr = fr;
+            if let Err(e) = check(av_hwframe_ctx_init(fr), "overlay frames ctx") {
+                av_buffer_unref(&mut fr);
+                return Err(e);
+            }
+            fr
+        }
+    };
+    let mut hw = av_frame_alloc();
+    let r = av_hwframe_get_buffer(frames, hw, 0);
+    if r < 0 {
+        av_frame_free(&mut hw);
+        let mut f = frames;
+        av_buffer_unref(&mut f);
+        bail!("overlay surface: {}", err_str(r));
+    }
+    let mut sw = av_frame_alloc();
+    (*sw).format = AVPixelFormat::AV_PIX_FMT_BGRA as c_int;
+    (*sw).width = img.w as c_int;
+    (*sw).height = img.h as c_int;
+    check(av_frame_get_buffer(sw, 0), "overlay buffer")?;
+    let row = img.w as usize * 4;
+    let ls = (*sw).linesize[0] as usize;
+    for y in 0..img.h as usize {
+        std::ptr::copy_nonoverlapping(img.bgra.as_ptr().add(y * row), (*sw).data[0].add(y * ls), row);
+    }
+    let r = av_hwframe_transfer_data(hw, sw, 0);
+    av_frame_free(&mut sw);
+    if r < 0 {
+        av_frame_free(&mut hw);
+        let mut f = frames;
+        av_buffer_unref(&mut f);
+        bail!("overlay upload: {}", err_str(r));
+    }
+    Ok(OverlaySurface { frames, frame: HwFrame(hw), w: img.w, h: img.h })
+}
 
 unsafe extern "C" fn write_cb(opaque: *mut c_void, buf: *const u8, size: c_int) -> c_int {
     let w = &mut *(opaque as *mut Box<dyn Write + Send>);
@@ -496,14 +580,22 @@ pub fn vaapi_encoder_name(c: Codec) -> &'static str {
 }
 
 impl GpuEncoder {
-    pub fn new(params: &VideoParams, out_w: u32, out_h: u32, sink: Box<dyn Write + Send>) -> GpuEncoder {
+    pub fn new(
+        params: &VideoParams,
+        out_w: u32,
+        out_h: u32,
+        sink: Box<dyn Write + Send>,
+        overlays: Option<std::sync::Arc<crate::overlays::OverlayHub>>,
+    ) -> GpuEncoder {
         GpuEncoder {
             params: params.clone(),
             out_w,
             out_h,
             graph: None,
-            graph_key: (0, 0, 0),
+            graph_key: (0, 0, 0, vec![]),
             bg: None,
+            overlays,
+            ov_cache: Default::default(),
             enc: ptr::null_mut(),
             oc: ptr::null_mut(),
             stream: ptr::null_mut(),
@@ -602,10 +694,46 @@ impl GpuEncoder {
     pub fn encode(&mut self, frame: &HwFrame) -> Result<()> {
         unsafe {
             let (w, h) = (frame.width(), frame.height());
-            let fctx = (*(*frame.as_ptr()).hw_frames_ctx).data as usize;
-            if self.graph.is_none() || self.graph_key != (w, h, fctx) {
+            let in_frames = (*frame.as_ptr()).hw_frames_ctx;
+            let fctx = (*in_frames).data as usize;
+            let (ow, oh) = (self.out_w, self.out_h);
+
+            // Current overlays: upload changed images, collect their geometry.
+            let layers = self.overlays.as_ref().map(|h| h.layers()).unwrap_or_default();
+            let mut geoms: Vec<OverlayGeom> = vec![];
+            let mut live = std::collections::HashSet::new();
+            for l in layers.iter().take(4) {
+                let (x, y, dw, dh) = l.rect(ow, oh);
+                let stale = self.ov_cache.get(&l.corner).map(|(v, _)| *v != l.version).unwrap_or(true);
+                if stale {
+                    let reuse = self.ov_cache.remove(&l.corner).map(|(_, s)| s);
+                    match upload_bgra(in_frames, &l.image, reuse) {
+                        Ok(surf) => {
+                            self.ov_cache.insert(l.corner, (l.version, surf));
+                        }
+                        Err(e) => {
+                            log::warn!("overlay upload failed: {e:#}");
+                            continue;
+                        }
+                    }
+                }
+                live.insert(l.corner);
+                geoms.push(OverlayGeom {
+                    corner: l.corner,
+                    img_w: l.image.w,
+                    img_h: l.image.h,
+                    x,
+                    y,
+                    w: dw,
+                    h: dh,
+                    alpha_milli: (l.opacity * 1000.0) as u32,
+                });
+            }
+            self.ov_cache.retain(|c, _| live.contains(c));
+
+            let key = (w, h, fctx, geoms.clone());
+            if self.graph.is_none() || self.graph_key != key {
                 let fmt = if self.params.ten_bit && self.params.codec != Codec::H264 { "p010" } else { "nv12" };
-                let (ow, oh) = (self.out_w, self.out_h);
                 // Keep the aspect ratio of whatever is captured right now and letterbox it into the
                 // fixed output size (the source can change size, e.g. desktop ↔ game window).
                 // The bars come from a real black surface (overlay_vaapi) – VPP fill colours are
@@ -613,48 +741,82 @@ impl GpuEncoder {
                 let fps = self.params.fps.max(1) as c_int;
                 let tb = AVRational { num: 1, den: fps };
                 let ten = fmt == "p010";
-                let in_frames = (*frame.as_ptr()).hw_frames_ctx;
                 self.graph = None;
                 self.bg = None;
+                let mut ins = vec![GraphInput { label: "in", w: w as c_int, h: h as c_int, fmt: AVPixelFormat::AV_PIX_FMT_VAAPI, hw_frames: in_frames }];
+                let mut desc;
                 if (w as u64) * (oh as u64) == (h as u64) * (ow as u64) {
-                    let desc = format!("scale_vaapi=w={ow}:h={oh}:format={fmt}:extra_hw_frames=8");
-                    let sw_fmt = AVPixelFormat::AV_PIX_FMT_VAAPI;
-                    self.graph = Some(Graph::new(&desc, w as c_int, h as c_int, sw_fmt, tb, in_frames)?);
+                    desc = format!("[in]scale_vaapi=w={ow}:h={oh}:format={fmt}:extra_hw_frames=8[base]");
                 } else {
                     let bg = HwFrame(black_surface(in_frames, ow, oh, ten)?);
-                    let desc = format!(
+                    desc = format!(
                         "[in]scale_vaapi=w={ow}:h={oh}:force_original_aspect_ratio=decrease:force_divisible_by=2:format={fmt}[fg];\
-                         [bg][fg]overlay_vaapi=x=(W-w)/2:y=(H-h)/2:extra_hw_frames=8"
+                         [bg][fg]overlay_vaapi=x=(W-w)/2:y=(H-h)/2:extra_hw_frames=8[base]"
                     );
-                    let ins = [
-                        GraphInput { label: "in", w: w as c_int, h: h as c_int, fmt: AVPixelFormat::AV_PIX_FMT_VAAPI, hw_frames: in_frames },
-                        GraphInput {
-                            label: "bg",
-                            w: ow as c_int,
-                            h: oh as c_int,
-                            fmt: AVPixelFormat::AV_PIX_FMT_VAAPI,
-                            hw_frames: (*bg.as_ptr()).hw_frames_ctx,
-                        },
-                    ];
-                    self.graph = Some(Graph::new_multi(&desc, tb, &ins)?);
+                    ins.push(GraphInput {
+                        label: "bg",
+                        w: ow as c_int,
+                        h: oh as c_int,
+                        fmt: AVPixelFormat::AV_PIX_FMT_VAAPI,
+                        hw_frames: (*bg.as_ptr()).hw_frames_ctx,
+                    });
                     self.bg = Some(bg);
                 }
-                self.graph_key = (w, h, fctx);
-                log::debug!("GPU encoder input {w}x{h} → {ow}x{oh}");
+                // Overlays: scaled and alpha-blended on the GPU.
+                const OV_LABELS: [&str; 4] = ["ov0", "ov1", "ov2", "ov3"];
+                let mut prev = "base".to_string();
+                for (i, g) in geoms.iter().enumerate() {
+                    let surf = &self.ov_cache[&g.corner].1;
+                    let next = format!("l{i}");
+                    desc.push_str(&format!(
+                        ";[{prev}][{}]overlay_vaapi=x={}:y={}:w={}:h={}:alpha={:.3}:extra_hw_frames=8[{next}]",
+                        OV_LABELS[i],
+                        g.x,
+                        g.y,
+                        g.w,
+                        g.h,
+                        g.alpha_milli as f32 / 1000.0
+                    ));
+                    ins.push(GraphInput {
+                        label: OV_LABELS[i],
+                        w: g.img_w as c_int,
+                        h: g.img_h as c_int,
+                        fmt: AVPixelFormat::AV_PIX_FMT_VAAPI,
+                        hw_frames: (*surf.frame.as_ptr()).hw_frames_ctx,
+                    });
+                    prev = next;
+                }
+                // The last output label stays open → it is connected to the sink.
+                let tail = format!("[{prev}]");
+                if desc.ends_with(&tail) {
+                    desc.truncate(desc.len() - tail.len());
+                }
+                self.graph = Some(Graph::new_multi(&desc, tb, &ins)?);
+                self.graph_key = key;
+                log::debug!("GPU encoder input {w}x{h} → {ow}x{oh}, {} overlay(s)", geoms.len());
             }
-            let mut f = frame.clone_raw();
-            (*f).pts = self.pts;
+            let pts = self.pts;
             self.pts += 1;
+            // Inputs: 0 = capture, (1 = black background), then the overlays.
+            let mut idx = 1;
             if let Some(bg) = &self.bg {
                 let mut b = bg.clone_raw();
-                (*b).pts = (*f).pts;
-                let r = self.graph.as_mut().unwrap().push_to(1, b);
+                (*b).pts = pts;
+                let r = self.graph.as_mut().unwrap().push_to(idx, b);
                 av_frame_free(&mut b);
-                if let Err(e) = r {
-                    av_frame_free(&mut f);
-                    return Err(e);
-                }
+                r?;
+                idx += 1;
             }
+            for g in &geoms {
+                let mut o = self.ov_cache[&g.corner].1.frame.clone_raw();
+                (*o).pts = pts;
+                let r = self.graph.as_mut().unwrap().push_to(idx, o);
+                av_frame_free(&mut o);
+                r?;
+                idx += 1;
+            }
+            let mut f = frame.clone_raw();
+            (*f).pts = pts;
             let g = self.graph.as_mut().unwrap();
             let r = g.push(f);
             av_frame_free(&mut f);

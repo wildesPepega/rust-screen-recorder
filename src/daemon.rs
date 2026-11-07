@@ -76,6 +76,8 @@ struct Daemon {
     last_link: String,
     upload_queue: std::collections::VecDeque<(PathBuf, Option<String>)>,
     upload: Option<UploadJob>,
+    /// Video overlays shared with all encoders.
+    overlays: Arc<crate::overlays::OverlayHub>,
 }
 
 struct UploadJob {
@@ -142,7 +144,7 @@ async fn async_main(update_note: Option<(ToastKind, String, String)>) -> Result<
     // D-Bus: single instance + KWin script sink.
     let (win_tx, mut win_rx) = mpsc::unbounded_channel::<WindowUpdate>();
     let dbus = zbus::connection::Builder::session()?
-        .name(kwin::BUS_NAME)?
+        .name(kwin::bus_name())?
         .serve_at("/KWin", KwinSink { tx: win_tx })?
         .build()
         .await
@@ -167,12 +169,18 @@ async fn async_main(update_note: Option<(ToastKind, String, String)>) -> Result<
 
     // Hotkeys
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel::<HotkeyAction>();
-    if let Err(e) = hotkeys::register(&dbus, &cfg.hotkeys).await {
+    if kwin::instance().is_some() {
+        log::info!("test instance {:?}: no global hotkeys, no tray", kwin::instance());
+    } else if let Err(e) = hotkeys::register(&dbus, &cfg.hotkeys).await {
         log::error!("could not register global shortcuts: {e:#}");
     }
     {
         let conn = dbus.clone();
+        let listen = kwin::instance().is_none();
         tokio::spawn(async move {
+            if !listen {
+                return;
+            }
             if let Err(e) = hotkeys::listen(conn, hk_tx).await {
                 log::error!("hotkey listener: {e:#}");
             }
@@ -218,7 +226,7 @@ async fn async_main(update_note: Option<(ToastKind, String, String)>) -> Result<
     }
 
     // Tray
-    let tray = crate::tray::spawn(tx.clone()).await;
+    let tray = if kwin::instance().is_some() { None } else { crate::tray::spawn(tx.clone()).await };
 
     // Signals
     {
@@ -257,6 +265,7 @@ async fn async_main(update_note: Option<(ToastKind, String, String)>) -> Result<
         last_link: String::new(),
         upload_queue: Default::default(),
         upload: None,
+        overlays: crate::overlays::OverlayHub::new(),
         toaster: match crate::toast::Toaster::start() {
             Ok(t) => Some(t),
             Err(e) => {
@@ -362,8 +371,8 @@ impl Daemon {
                     Ok(up) => {
                         self.last_link = up.url.clone();
                         let copied = self.cfg.fireshare.copy_link && crate::fireshare::copy_to_clipboard(&self.dbus, &up.url).await;
-                        let title = if up.duplicate { "Already on FireShare" } else { "Uploaded to FireShare" };
-                        let body = if copied { format!("Link copied · {}", up.url) } else { up.url.clone() };
+                        let title = if up.duplicate { "Already on FireShare" } else { "Upload successful" };
+                        let body = if copied { "Share link copied to the clipboard".to_string() } else { name.clone() };
                         self.last_message = format!("{title}: {} ({name})", up.url);
                         self.notify(ToastKind::Success, title, &body).await;
                     }
@@ -468,6 +477,10 @@ impl Daemon {
                     || old.general.zero_copy != self.cfg.general.zero_copy;
                 if old.general.capture_mode != self.cfg.general.capture_mode {
                     self.on_windows_changed().await;
+                }
+                // Overlays can be changed live – the running encoders pick them up.
+                if old.overlays != self.cfg.overlays && (self.replay.is_some() || self.recording.is_some()) {
+                    self.overlays.start(&self.cfg.overlays);
                 }
                 if replay_cfg_changed && self.replay.is_some() {
                     self.stop_replay();
@@ -642,6 +655,9 @@ impl Daemon {
 
     /// Stop every capture that neither replay nor recording uses any more.
     fn release_unused(&mut self) {
+        if self.replay.is_none() && self.recording.is_none() {
+            self.overlays.stop();
+        }
         let used: Vec<StreamSource> =
             self.replay.iter().map(|r| r.source.clone()).chain(self.recording.iter().map(|r| r.source.clone())).collect();
         let mut keep = vec![];
@@ -700,7 +716,10 @@ impl Daemon {
         if r.storage == ReplayStorage::Ram && !PathBuf::from("/dev/shm").is_dir() {
             return Err(anyhow!("/dev/shm is not available for RAM replay"));
         }
-        match ReplaySession::start(handle.clone(), hint, &r.video.effective(), &r.audio, &self.encoders, dir, r.duration_secs.max(5)) {
+        self.overlays.start(&self.cfg.overlays);
+        let ov = Some(self.overlays.clone());
+        let r = &self.cfg.replay;
+        match ReplaySession::start(handle.clone(), hint, &r.video.effective(), &r.audio, &self.encoders, dir, r.duration_secs.max(5), ov) {
             Ok(s) => {
                 self.replay = Some(Replay { session: s, source: src, handle, game });
                 self.last_message = "Instant Replay is on".into();
@@ -814,7 +833,10 @@ impl Daemon {
         let v = rc.video.effective();
         let container = crate::encoders::effective_container(v.codec, v.container);
         let path = self.output_file(&rc.output_dir, game.as_deref(), "Recording", container.ext());
-        match EncoderSession::spawn("recording", handle.clone(), hint, &v, &rc.audio, &self.encoders, Output::File(path.clone())) {
+        self.overlays.start(&self.cfg.overlays);
+        let ov = Some(self.overlays.clone());
+        let rc = &self.cfg.recording;
+        match EncoderSession::spawn("recording", handle.clone(), hint, &v, &rc.audio, &self.encoders, Output::File(path.clone()), ov) {
             Ok(enc) => {
                 self.recording = Some(Recording { enc, path: path.clone(), game: game.clone(), source: src, handle });
                 self.last_message = format!("Recording to {}", path.display());

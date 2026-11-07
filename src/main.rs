@@ -14,6 +14,7 @@ mod hotkeys;
 mod install;
 mod ipc;
 mod kwin;
+mod overlays;
 mod session;
 mod toast;
 mod tray;

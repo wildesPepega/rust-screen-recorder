@@ -10,6 +10,7 @@ use std::sync::mpsc::{channel, Receiver};
 pub fn parse_tab(s: &str) -> Option<Tab> {
     Some(match s {
         "general" | "global" => Tab::General,
+        "overlay" | "overlays" => Tab::Overlay,
         "replay" => Tab::Replay,
         "recording" => Tab::Recording,
         "hotkeys" => Tab::Hotkeys,
@@ -22,6 +23,7 @@ pub fn parse_tab(s: &str) -> Option<Tab> {
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Tab {
     General,
+    Overlay,
     Replay,
     Recording,
     Hotkeys,
@@ -31,13 +33,14 @@ pub enum Tab {
 
 impl Tab {
     /// Pages of the "Global Settings" section.
-    pub const GLOBAL: [Tab; 4] = [Tab::General, Tab::Hotkeys, Tab::Games, Tab::Status];
+    pub const GLOBAL: [Tab; 5] = [Tab::General, Tab::Overlay, Tab::Hotkeys, Tab::Games, Tab::Status];
     pub fn is_global(self) -> bool {
         Tab::GLOBAL.contains(&self)
     }
     pub fn title(self) -> &'static str {
         match self {
             Tab::General => "General",
+            Tab::Overlay => "Overlay",
             Tab::Replay => "Instant Replay Settings",
             Tab::Recording => "Recording Settings",
             Tab::Hotkeys => "Hotkeys",
@@ -82,6 +85,14 @@ pub struct SettingsEditor {
     fs_test: Option<Receiver<Result<String, String>>>,
     fs_result: Option<Result<String, String>>,
     show_token: bool,
+    /// Overlay tab state.
+    ov_sel: Corner,
+    ov_input_tex: Option<(InputOverlay, egui::TextureHandle, [usize; 2])>,
+    ov_web_job: Option<(Corner, Receiver<Result<crate::overlays::Image, String>>)>,
+    ov_web_tex: Option<(Corner, String, egui::TextureHandle, [usize; 2])>,
+    ov_web_err: Option<String>,
+    ov_drag: Option<egui::Pos2>,
+    ov_access: bool,
 }
 
 impl SettingsEditor {
@@ -98,6 +109,13 @@ impl SettingsEditor {
             fs_test: None,
             fs_result: None,
             show_token: false,
+            ov_sel: Corner::BottomLeft,
+            ov_input_tex: None,
+            ov_web_job: None,
+            ov_web_tex: None,
+            ov_web_err: None,
+            ov_drag: None,
+            ov_access: crate::overlays::input::has_access(),
         }
     }
 
@@ -183,6 +201,7 @@ impl SettingsEditor {
                 Tab::Hotkeys => self.hotkeys_tab(ui),
                 Tab::Games => self.games_tab(ui, st),
                 Tab::Status => self.status_tab(ui, st),
+                Tab::Overlay => self.overlay_tab(ui),
             });
         });
     }
@@ -650,6 +669,361 @@ impl SettingsEditor {
         }
     }
 
+    fn overlay_tab(&mut self, ui: &mut egui::Ui) {
+        // Finished website screenshot?
+        if let Some((corner, rx)) = &self.ov_web_job {
+            match rx.try_recv() {
+                Ok(Ok(img)) => {
+                    let url = self.cfg.overlays.slot(*corner).website.url.clone();
+                    let tex = ui.ctx().load_texture("web-shot", to_color_image(&img), egui::TextureOptions::LINEAR);
+                    self.ov_web_tex = Some((*corner, url, tex, [img.w as usize, img.h as usize]));
+                    self.ov_web_err = None;
+                    self.ov_web_job = None;
+                }
+                Ok(Err(e)) => {
+                    self.ov_web_err = Some(e);
+                    self.ov_web_job = None;
+                }
+                Err(_) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(150)),
+            }
+        }
+
+        ui.heading("Overlay");
+        ui.label(
+            RichText::new("Overlays are burned into your recordings and Instant Replay clips – they are not shown on your screen. Click a corner to configure it.")
+                .color(TEXT_DIM),
+        );
+        ui.checkbox(&mut self.cfg.overlays.enabled, "Show overlays in recordings and clips");
+        ui.add_space(6.0);
+
+        // ---- 16:9 monitor with the four corners -------------------------------------------------
+        let mon_w = ui.available_width().min(620.0);
+        let mon_h = mon_w * 9.0 / 16.0;
+        let (resp, painter) = ui.allocate_painter(egui::vec2(mon_w, mon_h + 26.0), egui::Sense::click());
+        let bezel = egui::Rect::from_min_size(resp.rect.min, egui::vec2(mon_w, mon_h));
+        let screen = bezel.shrink(8.0);
+        painter.rect_filled(bezel, 10.0, egui::Color32::from_rgb(0x0c, 0x0d, 0x10));
+        painter.rect_filled(screen, 4.0, egui::Color32::from_rgb(0x2a, 0x33, 0x44));
+        painter.text(screen.center(), egui::Align2::CENTER_CENTER, "Your recording", egui::FontId::proportional(16.0), egui::Color32::from_white_alpha(40));
+        // stand
+        let stand = egui::Rect::from_center_size(egui::pos2(bezel.center().x, bezel.max.y + 10.0), egui::vec2(mon_w * 0.18, 8.0));
+        painter.rect_filled(stand, 3.0, egui::Color32::from_rgb(0x0c, 0x0d, 0x10));
+
+        self.ensure_input_preview(ui.ctx());
+        let enabled = self.cfg.overlays.enabled;
+        for corner in Corner::ALL {
+            let slot = self.cfg.overlays.slot(corner).clone();
+            let (iw, ih) = self.estimated_size(corner, &slot);
+            let (sw, sh) = (screen.width() as u32 * 4, screen.height() as u32 * 4); // sub-pixel precision
+            let (x, y, w, h) = if slot.kind == OverlayKind::None {
+                // empty corner: small placeholder box
+                crate::overlays::place(corner, 18.0, 3.0, 16, 9, sw, sh)
+            } else {
+                crate::overlays::place(corner, slot.size_percent, slot.margin_percent, iw, ih, sw, sh)
+            };
+            let r = egui::Rect::from_min_size(
+                screen.min + egui::vec2(x as f32 / 4.0, y as f32 / 4.0),
+                egui::vec2(w as f32 / 4.0, h as f32 / 4.0),
+            );
+            let selected = self.ov_sel == corner;
+            let hovered = resp.hover_pos().is_some_and(|p| r.contains(p));
+            if slot.kind == OverlayKind::None {
+                painter.rect_stroke(r, 6.0, egui::Stroke::new(1.5_f32, egui::Color32::from_white_alpha(if hovered { 140 } else { 60 })), egui::StrokeKind::Inside);
+                painter.text(r.center(), egui::Align2::CENTER_CENTER, "+ Add", egui::FontId::proportional(13.0), egui::Color32::from_white_alpha(140));
+            } else {
+                let tint = egui::Color32::from_white_alpha(((if enabled { 255.0 } else { 110.0 }) * slot.opacity) as u8);
+                let textured = match slot.kind {
+                    OverlayKind::Input => self.ov_input_tex.as_ref().map(|(_, t, _)| t.id()),
+                    OverlayKind::Website => self.ov_web_tex.as_ref().filter(|(c, u, _, _)| *c == corner && *u == slot.website.url).map(|(_, _, t, _)| t.id()),
+                    _ => None,
+                };
+                match textured {
+                    Some(id) => {
+                        let uv = if slot.kind == OverlayKind::Website { self.crop_uv(&slot) } else { egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)) };
+                        painter.image(id, r, uv, tint);
+                    }
+                    None => {
+                        painter.rect_filled(r, 6.0, egui::Color32::from_rgba_unmultiplied(20, 22, 28, 200));
+                        let icon = match slot.kind {
+                            OverlayKind::Webcam => "📷 Webcam",
+                            OverlayKind::Website => "🌐 Website",
+                            _ => slot.kind.label(),
+                        };
+                        painter.text(r.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(13.0), egui::Color32::WHITE);
+                    }
+                }
+            }
+            if selected {
+                painter.rect_stroke(r.expand(2.0), 7.0, egui::Stroke::new(2.0_f32, ACCENT), egui::StrokeKind::Outside);
+            } else if hovered && slot.kind != OverlayKind::None {
+                painter.rect_stroke(r.expand(1.0), 7.0, egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(160)), egui::StrokeKind::Outside);
+            }
+            if resp.clicked() && hovered {
+                self.ov_sel = corner;
+            }
+        }
+        // clicking anywhere selects the nearest corner
+        if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let left = p.x < screen.center().x;
+                let top = p.y < screen.center().y;
+                self.ov_sel = match (top, left) {
+                    (true, true) => Corner::TopLeft,
+                    (true, false) => Corner::TopRight,
+                    (false, true) => Corner::BottomLeft,
+                    (false, false) => Corner::BottomRight,
+                };
+            }
+        }
+
+        // ---- settings of the selected corner -------------------------------------------------
+        ui.add_space(8.0);
+        let corner = self.ov_sel;
+        ui.label(RichText::new(format!("{} corner", corner.label())).strong().size(16.0));
+        let slot = self.cfg.overlays.slot_mut(corner);
+        ui.horizontal(|ui| {
+            for k in OverlayKind::ALL {
+                ui.selectable_value(&mut slot.kind, k, k.label());
+            }
+        });
+        if slot.kind == OverlayKind::None {
+            return;
+        }
+        Grid::new("ov-common").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+            ui.label("Size");
+            ui.add(Slider::new(&mut slot.size_percent, 5.0..=60.0).suffix(" % of the video width"));
+            ui.end_row();
+            ui.label("Opacity");
+            let mut op = slot.opacity * 100.0;
+            if ui.add(Slider::new(&mut op, 10.0..=100.0).suffix(" %")).changed() {
+                slot.opacity = op / 100.0;
+            }
+            ui.end_row();
+            ui.label("Distance to the edge");
+            ui.add(Slider::new(&mut slot.margin_percent, 0.0..=10.0).suffix(" %"));
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        match slot.kind {
+            OverlayKind::Input => {
+                Grid::new("ov-input").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                    ui.label("Keyboard");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut slot.input.layout, KeyboardLayout::Gaming, "Gaming (left half)");
+                        ui.radio_value(&mut slot.input.layout, KeyboardLayout::Full, "Whole keyboard");
+                    });
+                    ui.end_row();
+                    ui.label("Mouse");
+                    ui.checkbox(&mut slot.input.show_mouse, "Show the mouse (buttons, wheel, scrolling, side buttons)");
+                    ui.end_row();
+                    ui.label("Key labels");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut slot.input.labels, KeyLabels::Auto, "Automatic");
+                        ui.radio_value(&mut slot.input.labels, KeyLabels::De, "German (QWERTZ)");
+                        ui.radio_value(&mut slot.input.labels, KeyLabels::Us, "US (QWERTY)");
+                    });
+                    ui.end_row();
+                });
+                if !self.ov_access {
+                    ui.add_space(6.0);
+                    egui::Frame::new().fill(egui::Color32::from_rgb(0x3a, 0x2a, 0x12)).corner_radius(6).inner_margin(10).show(ui, |ui| {
+                        ui.label(RichText::new("Keyboard & mouse access needed").strong().color(egui::Color32::from_rgb(0xff, 0xc0, 0x60)));
+                        ui.label("Wayland does not let apps see global key presses. The overlay reads your keyboard and mouse directly, which needs membership in the 'input' group. Run this once, then log out and back in:");
+                        let mut cmd = "sudo usermod -aG input $USER".to_string();
+                        ui.add(egui::TextEdit::singleline(&mut cmd).code_editor().desired_width(320.0));
+                        ui.label(RichText::new("Note: every program you run can then read keyboard input. Rust Screen Recorder only uses the current key state for drawing and never stores it.").small().color(TEXT_DIM));
+                    });
+                }
+            }
+            OverlayKind::Webcam => {
+                let cams = crate::overlays::webcam::list();
+                Grid::new("ov-cam").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                    ui.label("Camera");
+                    let cur = if slot.webcam.device.is_empty() {
+                        "First camera".to_string()
+                    } else {
+                        cams.iter().find(|(d, _)| *d == slot.webcam.device).map(|(d, n)| format!("{n} ({d})")).unwrap_or(slot.webcam.device.clone())
+                    };
+                    ComboBox::from_id_salt("ov-cam-dev").width(320.0).selected_text(cur).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut slot.webcam.device, String::new(), "First camera");
+                        for (d, n) in &cams {
+                            ui.selectable_value(&mut slot.webcam.device, d.clone(), format!("{n} ({d})"));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Mirror");
+                    ui.checkbox(&mut slot.webcam.mirror, "Mirror the image (like a selfie view)");
+                    ui.end_row();
+                });
+                if cams.is_empty() {
+                    ui.label(RichText::new("No webcam is connected right now.").color(RED));
+                }
+            }
+            OverlayKind::Website => {
+                let mut load = false;
+                Grid::new("ov-web").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                    ui.label("URL");
+                    ui.add(egui::TextEdit::singleline(&mut slot.website.url).hint_text("https://… (alerts, chat, widgets)").desired_width(420.0));
+                    ui.end_row();
+                    ui.label("Page size");
+                    ui.horizontal(|ui| {
+                        ui.add(DragValue::new(&mut slot.website.page_width).range(200..=3840).suffix(" px"));
+                        ui.label("×");
+                        ui.add(DragValue::new(&mut slot.website.page_height).range(100..=2160).suffix(" px"));
+                    });
+                    ui.end_row();
+                    ui.label("Background");
+                    ui.checkbox(&mut slot.website.transparent, "Transparent page background");
+                    ui.end_row();
+                    ui.label("Editor");
+                    ui.horizontal(|ui| {
+                        load = ui.add_enabled(self.ov_web_job.is_none() && !slot.website.url.trim().is_empty(), egui::Button::new("Load page preview")).clicked();
+                        if self.ov_web_job.is_some() {
+                            ui.spinner();
+                            ui.label("loading…");
+                        }
+                    });
+                    ui.end_row();
+                });
+                if crate::overlays::web::find_browser().is_none() {
+                    ui.label(RichText::new("No Chromium-based browser found (Chromium, Chrome, Brave, Edge or Vivaldi is needed).").color(RED));
+                }
+                if let Some(e) = &self.ov_web_err {
+                    ui.label(RichText::new(e).color(RED));
+                }
+                if load {
+                    let cfg = slot.website.clone();
+                    let (tx, rx) = channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(crate::overlays::web::screenshot(&cfg).map_err(|e| format!("{e:#}")));
+                    });
+                    self.ov_web_job = Some((corner, rx));
+                }
+                self.website_editor(ui, corner);
+            }
+            OverlayKind::None => {}
+        }
+    }
+
+    /// Image size used for the preview boxes.
+    fn estimated_size(&self, _corner: Corner, slot: &OverlaySlot) -> (u32, u32) {
+        match slot.kind {
+            OverlayKind::Input => self.ov_input_tex.as_ref().map(|(_, _, s)| (s[0] as u32, s[1] as u32)).unwrap_or((700, 260)),
+            OverlayKind::Webcam => (16, 9),
+            OverlayKind::Website => {
+                let w = &slot.website;
+                if w.crop_w > 0 && w.crop_h > 0 {
+                    (w.crop_w, w.crop_h)
+                } else {
+                    (w.page_width.max(1), w.page_height.max(1))
+                }
+            }
+            OverlayKind::None => (16, 9),
+        }
+    }
+
+    fn crop_uv(&self, slot: &OverlaySlot) -> egui::Rect {
+        let w = &slot.website;
+        let (pw, ph) = (w.page_width.max(1) as f32, w.page_height.max(1) as f32);
+        if w.crop_w == 0 || w.crop_h == 0 {
+            return egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        }
+        egui::Rect::from_min_max(
+            egui::pos2(w.crop_x as f32 / pw, w.crop_y as f32 / ph),
+            egui::pos2(((w.crop_x + w.crop_w) as f32 / pw).min(1.0), ((w.crop_y + w.crop_h) as f32 / ph).min(1.0)),
+        )
+    }
+
+    fn ensure_input_preview(&mut self, ctx: &egui::Context) {
+        let Some(slot) = Corner::ALL.iter().map(|c| self.cfg.overlays.slot(*c)).find(|s| s.kind == OverlayKind::Input) else { return };
+        if self.ov_input_tex.as_ref().is_some_and(|(c, _, _)| *c == slot.input) {
+            return;
+        }
+        if let Some(img) = crate::overlays::input::preview(&slot.input) {
+            let tex = ctx.load_texture("input-preview", to_color_image(&img), egui::TextureOptions::LINEAR);
+            self.ov_input_tex = Some((slot.input.clone(), tex, [img.w as usize, img.h as usize]));
+        }
+    }
+
+    /// Screenshot of the page with a draggable crop rectangle.
+    fn website_editor(&mut self, ui: &mut egui::Ui, corner: Corner) {
+        let Some((c, url, tex, size)) = &self.ov_web_tex else {
+            ui.label(RichText::new("Load the page preview to choose the visible part with the mouse.").small().color(TEXT_DIM));
+            return;
+        };
+        let slot = self.cfg.overlays.slot_mut(corner);
+        if *c != corner || *url != slot.website.url {
+            ui.label(RichText::new("Load the page preview again to edit this overlay.").small().color(TEXT_DIM));
+            return;
+        }
+        ui.add_space(4.0);
+        ui.label(RichText::new("Drag on the page to cut out the part that should be visible.").small().color(TEXT_DIM));
+        let (pw, ph) = (size[0] as f32, size[1] as f32);
+        let disp_w = ui.available_width().min(620.0);
+        let disp_h = disp_w * ph / pw;
+        let (resp, painter) = ui.allocate_painter(egui::vec2(disp_w, disp_h), egui::Sense::drag());
+        let r = resp.rect;
+        // checkerboard so transparent parts are visible
+        let cell = 12.0;
+        let (nx, ny) = ((disp_w / cell).ceil() as i32, (disp_h / cell).ceil() as i32);
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let col = if (ix + iy) % 2 == 0 { egui::Color32::from_gray(58) } else { egui::Color32::from_gray(42) };
+                let cr = egui::Rect::from_min_size(r.min + egui::vec2(ix as f32 * cell, iy as f32 * cell), egui::vec2(cell, cell)).intersect(r);
+                painter.rect_filled(cr, 0.0, col);
+            }
+        }
+        painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        let to_page = |p: egui::Pos2| (((p.x - r.min.x) / disp_w * pw).clamp(0.0, pw), ((p.y - r.min.y) / disp_h * ph).clamp(0.0, ph));
+        if resp.drag_started() {
+            self.ov_drag = resp.interact_pointer_pos();
+        }
+        if let (Some(a), Some(b)) = (self.ov_drag, resp.interact_pointer_pos()) {
+            if resp.dragged() || resp.drag_stopped() {
+                let (ax, ay) = to_page(a);
+                let (bx, by) = to_page(b);
+                let (x0, y0, x1, y1) = (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by));
+                if x1 - x0 > 8.0 && y1 - y0 > 8.0 {
+                    slot.website.crop_x = x0 as u32;
+                    slot.website.crop_y = y0 as u32;
+                    slot.website.crop_w = (x1 - x0) as u32;
+                    slot.website.crop_h = (y1 - y0) as u32;
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            self.ov_drag = None;
+        }
+        // crop rectangle + dimmed outside
+        let w = &slot.website;
+        if w.crop_w > 0 && w.crop_h > 0 {
+            let cr = egui::Rect::from_min_size(
+                r.min + egui::vec2(w.crop_x as f32 / pw * disp_w, w.crop_y as f32 / ph * disp_h),
+                egui::vec2(w.crop_w as f32 / pw * disp_w, w.crop_h as f32 / ph * disp_h),
+            );
+            let dim = egui::Color32::from_black_alpha(150);
+            painter.rect_filled(egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, cr.min.y)), 0.0, dim);
+            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(r.min.x, cr.max.y), r.max), 0.0, dim);
+            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(r.min.x, cr.min.y), egui::pos2(cr.min.x, cr.max.y)), 0.0, dim);
+            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(cr.max.x, cr.min.y), egui::pos2(r.max.x, cr.max.y)), 0.0, dim);
+            painter.rect_stroke(cr, 0.0, egui::Stroke::new(2.0_f32, ACCENT), egui::StrokeKind::Outside);
+        }
+        let slot = self.cfg.overlays.slot_mut(corner);
+        ui.horizontal(|ui| {
+            ui.label("Cut-out");
+            ui.add(DragValue::new(&mut slot.website.crop_x).prefix("x "));
+            ui.add(DragValue::new(&mut slot.website.crop_y).prefix("y "));
+            ui.add(DragValue::new(&mut slot.website.crop_w).prefix("w "));
+            ui.add(DragValue::new(&mut slot.website.crop_h).prefix("h "));
+            if ui.button("Whole page").clicked() {
+                slot.website.crop_x = 0;
+                slot.website.crop_y = 0;
+                slot.website.crop_w = 0;
+                slot.website.crop_h = 0;
+            }
+        });
+    }
+
     fn recording_tab(&mut self, ui: &mut egui::Ui, st: Option<&Status>) {
         ui.add_space(2.0);
         Grid::new("rec-paths").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
@@ -843,4 +1217,13 @@ impl SettingsEditor {
         ui.add_space(6.0);
         ui.label(RichText::new(format!("FFmpeg logs: {}", crate::session::log_dir().display())).color(TEXT_DIM));
     }
+}
+
+/// Straight-alpha BGRA → egui image.
+fn to_color_image(img: &crate::overlays::Image) -> egui::ColorImage {
+    let mut rgba = img.bgra.clone();
+    for p in rgba.chunks_exact_mut(4) {
+        p.swap(0, 2);
+    }
+    egui::ColorImage::from_rgba_unmultiplied([img.w as usize, img.h as usize], &rgba)
 }

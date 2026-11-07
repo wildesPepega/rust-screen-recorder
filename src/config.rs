@@ -520,6 +520,190 @@ impl Default for FireshareSettings {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Video overlays (burned into recordings and clips)
+// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    pub const ALL: [Corner; 4] = [Corner::TopLeft, Corner::TopRight, Corner::BottomLeft, Corner::BottomRight];
+    pub fn label(self) -> &'static str {
+        match self {
+            Corner::TopLeft => "Top left",
+            Corner::TopRight => "Top right",
+            Corner::BottomLeft => "Bottom left",
+            Corner::BottomRight => "Bottom right",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OverlayKind {
+    None,
+    /// Keyboard + mouse input display.
+    Input,
+    Webcam,
+    /// Any web page (alerts, chat, widgets …) rendered by a headless browser.
+    Website,
+}
+
+impl OverlayKind {
+    pub const ALL: [OverlayKind; 4] = [OverlayKind::None, OverlayKind::Input, OverlayKind::Webcam, OverlayKind::Website];
+    pub fn label(self) -> &'static str {
+        match self {
+            OverlayKind::None => "Empty",
+            OverlayKind::Input => "Keyboard & mouse",
+            OverlayKind::Webcam => "Webcam",
+            OverlayKind::Website => "Website",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyboardLayout {
+    /// Whole keyboard (F-row, main block, navigation, numpad).
+    Full,
+    /// The important left half for gaming (Esc–5/T/G/B, modifiers, space).
+    Gaming,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyLabels {
+    Auto,
+    De,
+    Us,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InputOverlay {
+    pub layout: KeyboardLayout,
+    pub show_mouse: bool,
+    pub labels: KeyLabels,
+}
+
+impl Default for InputOverlay {
+    fn default() -> Self {
+        Self { layout: KeyboardLayout::Gaming, show_mouse: true, labels: KeyLabels::Auto }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebcamOverlay {
+    /// /dev/videoN ("" = first camera).
+    pub device: String,
+    pub mirror: bool,
+}
+
+impl Default for WebcamOverlay {
+    fn default() -> Self {
+        Self { device: String::new(), mirror: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebsiteOverlay {
+    pub url: String,
+    /// Browser viewport the page is rendered at.
+    pub page_width: u32,
+    pub page_height: u32,
+    /// Part of the page that is shown (page pixels). w/h = 0 → whole page.
+    pub crop_x: u32,
+    pub crop_y: u32,
+    pub crop_w: u32,
+    pub crop_h: u32,
+    /// Transparent page background (for alert / chat widgets).
+    pub transparent: bool,
+}
+
+impl Default for WebsiteOverlay {
+    fn default() -> Self {
+        Self { url: String::new(), page_width: 1280, page_height: 720, crop_x: 0, crop_y: 0, crop_w: 0, crop_h: 0, transparent: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlaySlot {
+    pub kind: OverlayKind,
+    /// Width as percent of the video width.
+    pub size_percent: f32,
+    pub opacity: f32,
+    /// Distance from the corner in percent of the video height.
+    pub margin_percent: f32,
+    pub input: InputOverlay,
+    pub webcam: WebcamOverlay,
+    pub website: WebsiteOverlay,
+}
+
+impl Default for OverlaySlot {
+    fn default() -> Self {
+        Self {
+            kind: OverlayKind::None,
+            size_percent: 22.0,
+            opacity: 1.0,
+            margin_percent: 2.0,
+            input: InputOverlay::default(),
+            webcam: WebcamOverlay::default(),
+            website: WebsiteOverlay::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlaySettings {
+    /// Burn the overlays into recordings and instant replay clips.
+    pub enabled: bool,
+    pub top_left: OverlaySlot,
+    pub top_right: OverlaySlot,
+    pub bottom_left: OverlaySlot,
+    pub bottom_right: OverlaySlot,
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            top_left: OverlaySlot::default(),
+            top_right: OverlaySlot::default(),
+            bottom_left: OverlaySlot { kind: OverlayKind::Input, ..Default::default() },
+            bottom_right: OverlaySlot::default(),
+        }
+    }
+}
+
+impl OverlaySettings {
+    pub fn slot(&self, c: Corner) -> &OverlaySlot {
+        match c {
+            Corner::TopLeft => &self.top_left,
+            Corner::TopRight => &self.top_right,
+            Corner::BottomLeft => &self.bottom_left,
+            Corner::BottomRight => &self.bottom_right,
+        }
+    }
+    pub fn slot_mut(&mut self, c: Corner) -> &mut OverlaySlot {
+        match c {
+            Corner::TopLeft => &mut self.top_left,
+            Corner::TopRight => &mut self.top_right,
+            Corner::BottomLeft => &mut self.bottom_left,
+            Corner::BottomRight => &mut self.bottom_right,
+        }
+    }
+    pub fn active(&self) -> bool {
+        self.enabled && Corner::ALL.iter().any(|c| self.slot(*c).kind != OverlayKind::None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -529,6 +713,7 @@ pub struct Config {
     pub hotkeys: HotkeySettings,
     pub games: GameSettings,
     pub fireshare: FireshareSettings,
+    pub overlays: OverlaySettings,
 }
 
 pub fn default_video_dir() -> PathBuf {

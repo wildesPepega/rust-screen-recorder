@@ -84,6 +84,9 @@ pub enum Response {
 }
 
 pub fn socket_path() -> PathBuf {
+    if let Some(i) = crate::kwin::instance() {
+        return dirs::runtime_dir().unwrap_or_else(std::env::temp_dir).join(format!("rust-screen-recorder-{i}.sock"));
+    }
     dirs::runtime_dir().unwrap_or_else(std::env::temp_dir).join("rust-screen-recorder.sock")
 }
 

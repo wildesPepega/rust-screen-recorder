@@ -162,7 +162,9 @@ impl Overlay {
                         egui::ProgressBar::new(frac)
                             .desired_width(TILE_W - 40.0)
                             .fill(Color32::from_rgb(0x4d, 0xa3, 0xff))
-                            .text(RichText::new(label).small())
+                            // White, bold text with a dark outline-ish background stays readable on
+                            // both the blue fill and the dark track.
+                            .text(RichText::new(label).small().strong().color(Color32::WHITE).background_color(Color32::from_black_alpha(110)))
                             .animate(st.upload_phase != 1),
                     );
                     if st.upload_queue > 0 {

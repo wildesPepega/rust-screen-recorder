@@ -17,6 +17,8 @@ const W: u32 = 380;
 const H: u32 = 92;
 const SHOW_FOR: Duration = Duration::from_millis(3200);
 const FADE: Duration = Duration::from_millis(180);
+/// A queued toast replaces the visible one only after it was shown this long.
+const MIN_SHOW: Duration = Duration::from_millis(1600);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ToastKind {
@@ -75,13 +77,13 @@ impl Toaster {
 // Rendering
 // ------------------------------------------------------------------------------------------------
 
-struct Fonts {
-    bold: FontVec,
-    regular: FontVec,
+pub(crate) struct Fonts {
+    pub bold: FontVec,
+    pub regular: FontVec,
 }
 
 impl Fonts {
-    fn load() -> Result<Fonts> {
+    pub fn load() -> Result<Fonts> {
         let find = |pattern: &str| -> Result<FontVec> {
             let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output()?;
             let path = String::from_utf8_lossy(&out.stdout).to_string();
@@ -92,7 +94,7 @@ impl Fonts {
     }
 }
 
-fn draw_text(pm: &mut Pixmap, font: &FontVec, size: f32, x: f32, baseline: f32, max_w: f32, text: &str, rgb: (u8, u8, u8), alpha: f32) {
+pub(crate) fn draw_text(pm: &mut Pixmap, font: &FontVec, size: f32, x: f32, baseline: f32, max_w: f32, text: &str, rgb: (u8, u8, u8), alpha: f32) {
     let scaled = font.as_scaled(PxScale::from(size));
     let mut caret = x;
     // Ellipsize when too long.
@@ -281,14 +283,26 @@ fn shm_buffer(st: &State, qh: &QueueHandle<State>, pixels: &[u8]) -> Result<wl_b
 
 fn run(conn: Connection, mut queue: EventQueue<State>, qh: QueueHandle<State>, mut st: State, rx: Receiver<Toast>, fonts: Fonts) -> Result<()> {
     let mut shown: Option<Shown> = None;
+    let mut pending: std::collections::VecDeque<Toast> = Default::default();
     loop {
-        // New toast?
-        let timeout = if shown.is_some() { Duration::from_millis(16) } else { Duration::from_millis(250) };
+        // Collect new toasts; they are shown one after another (each at least MIN_SHOW).
+        let timeout = if shown.is_some() || !pending.is_empty() { Duration::from_millis(16) } else { Duration::from_millis(250) };
         match rx.recv_timeout(timeout) {
-            Ok(mut t) => {
+            Ok(t) => {
+                pending.push_back(t);
                 while let Ok(n) = rx.try_recv() {
-                    t = n; // only the newest matters
+                    pending.push_back(n);
                 }
+                while pending.len() > 6 {
+                    pending.pop_front();
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(_) => return Ok(()),
+        }
+        let ready = shown.as_ref().map(|s| s.since.elapsed() >= MIN_SHOW + FADE).unwrap_or(true);
+        if ready {
+            if let Some(t) = pending.pop_front() {
                 if let Some(s) = shown.as_mut() {
                     // Replace the content of the visible toast.
                     s.toast = t;
@@ -314,8 +328,6 @@ fn run(conn: Connection, mut queue: EventQueue<State>, qh: QueueHandle<State>, m
                     shown = Some(Shown { surface, layer, buffers: vec![], toast: t, since: Instant::now(), last_alpha: -1.0 });
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(_) => return Ok(()),
         }
 
         conn.flush()?;
