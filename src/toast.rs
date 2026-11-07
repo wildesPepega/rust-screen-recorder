@@ -37,8 +37,6 @@ pub struct Toast {
     pub kind: ToastKind,
     pub title: String,
     pub body: String,
-    /// Some(0..1) draws a progress bar; the toast stays visible while updates keep coming.
-    pub progress: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -68,13 +66,9 @@ impl Toaster {
     }
 
     pub fn show(&self, kind: ToastKind, title: impl Into<String>, body: impl Into<String>) {
-        let _ = self.tx.send(Toast { kind, title: title.into(), body: body.into(), progress: None });
+        let _ = self.tx.send(Toast { kind, title: title.into(), body: body.into() });
     }
 
-    /// Show / update a toast with a progress bar (call repeatedly; same toast is updated in place).
-    pub fn show_progress(&self, kind: ToastKind, title: impl Into<String>, body: impl Into<String>, progress: f32) {
-        let _ = self.tx.send(Toast { kind, title: title.into(), body: body.into(), progress: Some(progress.clamp(0.0, 1.0)) });
-    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -225,22 +219,7 @@ fn render(t: &Toast, fonts: &Fonts, alpha: f32) -> Vec<u8> {
         }
     }
     draw_text(&mut pm, &fonts.bold, 18.0, 64.0, 38.0, w - 80.0, &t.title, (0xf2, 0xf3, 0xf5), alpha);
-    let body_y = if t.progress.is_some() { 58.0 } else { 62.0 };
-    draw_text(&mut pm, &fonts.regular, 14.0, 64.0, body_y, w - 80.0, &t.body, (0xa8, 0xae, 0xb8), alpha);
-    if let Some(p) = t.progress {
-        // progress track + fill
-        let (bx, by, bw, bh) = (64.0, h - 20.0, w - 88.0, 6.0);
-        let mut tp = Paint::default();
-        tp.anti_alias = true;
-        tp.set_color(Color::from_rgba8(255, 255, 255, (38.0 * alpha) as u8));
-        let mut track = PathBuilder::new();
-        track.push_rect(Rect::from_xywh(bx, by, bw, bh).unwrap());
-        pm.fill_path(&track.finish().unwrap(), &tp, FillRule::Winding, Transform::identity(), None);
-        if p > 0.0 {
-            tp.set_color(Color::from_rgba8(accent.0, accent.1, accent.2, (255.0 * alpha) as u8));
-            pm.fill_rect(Rect::from_xywh(bx, by, (bw * p).max(2.0), bh).unwrap(), &tp, Transform::identity(), None);
-        }
-    }
+    draw_text(&mut pm, &fonts.regular, 14.0, 64.0, 62.0, w - 80.0, &t.body, (0xa8, 0xae, 0xb8), alpha);
     // tiny-skia: premultiplied RGBA → wl_shm ARGB8888 (little endian BGRA)
     let mut out = pm.take();
     for px in out.chunks_exact_mut(4) {
@@ -446,14 +425,9 @@ mod tests {
     fn toast_preview() {
         let Some(dir) = std::env::var_os("RSR_TOAST_PREVIEW") else { return };
         let fonts = Fonts::load().unwrap();
-        let p = crate::fireshare::Progress::default();
-        p.total.store(28_375_511, std::sync::atomic::Ordering::Relaxed);
-        p.sent.store(11_800_000, std::sync::atomic::Ordering::Relaxed);
-        p.phase.store(1, std::sync::atomic::Ordering::Relaxed);
-        let (title, body) = crate::daemon::progress_text(&p, "clip.mp4", 3.8, 2);
         let samples = [
-            ("upload", Toast { kind: ToastKind::Upload, title, body, progress: Some(p.fraction()) }),
-            ("done", Toast { kind: ToastKind::Success, title: "Uploaded to FireShare".into(), body: "Link copied · https://clips.example.com/watch/ef03ff6f…".into(), progress: None }),
+            ("upload", Toast { kind: ToastKind::Upload, title: "Uploading to FireShare…".into(), body: "Call of Duty_Replay_2026-11-07_07-11-19.mp4".into() }),
+            ("done", Toast { kind: ToastKind::Success, title: "Uploaded to FireShare".into(), body: "Link copied · https://clips.example.com/watch/ef03ff6f…".into() }),
         ];
         for (name, t) in samples {
             let mut px = render(&t, &fonts, 1.0);

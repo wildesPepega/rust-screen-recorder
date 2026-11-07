@@ -75,16 +75,12 @@ struct Daemon {
     uploading: bool,
     last_link: String,
     upload_queue: std::collections::VecDeque<(PathBuf, Option<String>)>,
-    /// Mirrors upload_queue.len() for the progress toast ticker.
-    queue_len: Arc<std::sync::atomic::AtomicUsize>,
     upload: Option<UploadJob>,
 }
 
 struct UploadJob {
     name: String,
     progress: Arc<crate::fireshare::Progress>,
-    /// Stops the toast ticker.
-    done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub fn run() -> Result<()> {
@@ -260,7 +256,6 @@ async fn async_main(update_note: Option<(ToastKind, String, String)>) -> Result<
         uploading: false,
         last_link: String::new(),
         upload_queue: Default::default(),
-        queue_len: Default::default(),
         upload: None,
         toaster: match crate::toast::Toaster::start() {
             Ok(t) => Some(t),
@@ -362,9 +357,7 @@ impl Daemon {
             }
             Event::UploadDone(r, name) => {
                 self.uploading = false;
-                if let Some(job) = self.upload.take() {
-                    job.done.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                self.upload = None;
                 match r {
                     Ok(up) => {
                         self.last_link = up.url.clone();
@@ -1061,39 +1054,21 @@ impl Daemon {
             return;
         }
         self.upload_queue.push_back((path, game));
-        self.queue_len.store(self.upload_queue.len().saturating_sub(usize::from(!self.uploading)), std::sync::atomic::Ordering::Relaxed);
         if self.uploading {
-            let n = self.upload_queue.len();
-            self.notify(ToastKind::Upload, "Queued for FireShare", &format!("{n} clip{} waiting", if n == 1 { "" } else { "s" })).await;
-            return;
+            return; // runs after the current upload
         }
         self.next_upload().await;
     }
 
     async fn next_upload(&mut self) {
         let Some((path, game)) = self.upload_queue.pop_front() else { return };
-        self.queue_len.store(self.upload_queue.len(), std::sync::atomic::Ordering::Relaxed);
         self.uploading = true;
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let progress = Arc::new(crate::fireshare::Progress::default());
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.upload = Some(UploadJob { name: name.clone(), progress: progress.clone(), done: done.clone() });
+        self.upload = Some(UploadJob { name: name.clone(), progress: progress.clone() });
 
-        // Progress toast, refreshed 4× per second while the upload runs.
-        if self.cfg.general.overlay_notifications {
-            if let Some(toaster) = self.toaster.clone() {
-                let (p, d, n, ql) = (progress.clone(), done.clone(), name.clone(), self.queue_len.clone());
-                tokio::spawn(async move {
-                    let start = std::time::Instant::now();
-                    while !d.load(std::sync::atomic::Ordering::Relaxed) {
-                        let queued = ql.load(std::sync::atomic::Ordering::Relaxed);
-                        let (title, body) = progress_text(&p, &n, start.elapsed().as_secs_f64(), queued);
-                        toaster.show_progress(ToastKind::Upload, title, body, p.fraction());
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                });
-            }
-        }
+        // Toasts only at start and end; live progress is shown in the overlay's Replay tile.
+        self.notify(ToastKind::Upload, "Uploading to FireShare…", &name).await;
 
         let cfg = self.cfg.fireshare.clone();
         let tx = self.tx.clone();
@@ -1157,26 +1132,6 @@ impl Daemon {
         self.release_unused();
         if let Some(mut o) = self.overlay.take() {
             let _ = o.kill();
-        }
-    }
-}
-
-/// "Uploading to FireShare · 42 %" / "clip.mp4 · 12.3 / 29.0 MB · 3.1 MB/s · 6 s left · +2 queued"
-pub fn progress_text(p: &crate::fireshare::Progress, name: &str, elapsed: f64, queued: usize) -> (String, String) {
-    use std::sync::atomic::Ordering;
-    let (sent, total, phase) = (p.sent.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed), p.phase.load(Ordering::Relaxed));
-    let q = if queued > 0 { format!(" · +{queued} queued") } else { String::new() };
-    match phase {
-        0 => ("Preparing upload…".into(), format!("{name}{q}")),
-        2 => ("Finishing upload…".into(), format!("FireShare is processing {name}{q}")),
-        _ => {
-            let pct = p.fraction() * 100.0;
-            let speed = if elapsed > 0.5 { sent as f64 / elapsed } else { 0.0 };
-            let eta = if speed > 0.0 && total > sent { format!(" · {:.0} s left", (total - sent) as f64 / speed) } else { String::new() };
-            (
-                format!("Uploading to FireShare · {pct:.0} %"),
-                format!("{:.1} / {:.1} MB · {:.1} MB/s{eta}{q}", sent as f64 / 1e6, total as f64 / 1e6, speed / 1e6),
-            )
         }
     }
 }

@@ -45,9 +45,9 @@ ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (
     optional folder per game.
   - The upload is chunked (8 MB), so it also works behind proxies with body limits; MKV is
     remuxed losslessly to MP4.
-  - Live progress: an in-game toast with a progress bar (percent, MB, speed, time left), a
-    progress bar in the overlay's Replay tile, and a text bar for the CLI. Several clips are
-    queued and uploaded one after another.
+  - A toast when an upload starts and one when it finishes (with the link). Live progress is
+    shown as a progress bar in the overlay's Replay tile; the CLI shows a text progress bar.
+    Several clips are queued and uploaded one after another.
   - In the overlay: *Upload last clip* / *Copy link*. CLI: `rust-screen-recorder upload <file> [game]`.
 - **In-game notifications:** Instant Replay on/off, clip saved (with the real clip length),
   recording started/saved and game detected. They are drawn on a layer-shell overlay surface above
