@@ -17,6 +17,7 @@ mod kwin;
 mod session;
 mod toast;
 mod tray;
+mod updater;
 mod wayland;
 
 use anyhow::{anyhow, Result};
@@ -35,6 +36,7 @@ USAGE:
     rust-screen-recorder ctl <ACTION>    control the running daemon
     rust-screen-recorder install         install the launcher entry (needed once for portal-free capture)
     rust-screen-recorder uninstall       remove launcher + autostart entries
+    rust-screen-recorder update          check for a new release and install it
     rust-screen-recorder upload <FILE> [GAME]   upload a video to FireShare, prints the share link
 
 ACTIONS:
@@ -163,6 +165,26 @@ fn main() {
             )
         }),
         Some("uninstall") => install::uninstall(),
+        Some("update") => match updater::check_and_install(&self_exe()) {
+            Err(e) => Err(e),
+            Ok(updater::Outcome::UpToDate) => {
+                println!("Rust Screen Recorder v{} is up to date.", updater::CURRENT);
+                Ok(())
+            }
+            Ok(updater::Outcome::Available(tag, why)) => {
+                println!("Update {tag} is available but was not installed: {why}");
+                Ok(())
+            }
+            Ok(updater::Outcome::Installed(tag)) => {
+                println!("Updated to {tag}. Restarting the background recorder…");
+                if ipc::daemon_running() {
+                    let _ = ipc::send(&Request::Quit);
+                    std::thread::sleep(Duration::from_millis(800));
+                    let _ = spawn_daemon();
+                }
+                Ok(())
+            }
+        },
         Some("upload") => match args.get(1) {
             Some(file) => {
                 let cfg = config::Config::load();

@@ -63,21 +63,38 @@ ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (
 - **PipeWire**, **FFmpeg** (the `ffmpeg`/`ffprobe` tools and the libraries)
 - For zero-copy GPU encoding: a VA-API driver (Mesa for AMD/Intel)
 
-## Install (release binary)
-
-Download `rust-screen-recorder-<version>-x86_64-linux.tar.gz` from the
-[Releases](https://github.com/wildesPepega/rust-screen-recorder/releases) page, then:
+## Install
 
 ```sh
-tar xf rust-screen-recorder-*-x86_64-linux.tar.gz
-cd rust-screen-recorder-*/
-install -Dm755 rust-screen-recorder ~/.local/bin/rust-screen-recorder
-~/.local/bin/rust-screen-recorder        # first start installs the launcher entry KWin checks
+curl -fsSL https://raw.githubusercontent.com/wildesPepega/rust-screen-recorder/main/install.sh | bash
 ```
 
-The binary is built on Arch Linux against **FFmpeg 9 (libavcodec 63)**, PipeWire 1.x and
-libva 2. On distributions with other FFmpeg versions, build from source. Bindings are generated
-at build time, so a source build always matches the system FFmpeg.
+The script:
+- downloads the latest release and verifies its SHA-256 checksum
+- installs to `~/.local/bin` (no root needed)
+- sets up the launcher entry that KWin checks for portal-free capture
+- starts the recorder; press **Alt+Z** for the overlay
+
+Options:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wildesPepega/rust-screen-recorder/main/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/wildesPepega/rust-screen-recorder/main/install.sh | bash -s -- --version v0.2.0
+curl -fsSL https://raw.githubusercontent.com/wildesPepega/rust-screen-recorder/main/install.sh | bash -s -- --no-start
+```
+
+`--uninstall` keeps your settings and clips.
+
+**Automatic updates:** at every start the recorder checks GitHub for a new release, verifies it,
+installs it and restarts itself – before anything is captured, so no replay is lost. A toast
+tells you about the new version. You can turn this off in *Global Settings → General → Updates*,
+or update by hand with `rust-screen-recorder update`. Development builds (run from `target/`) and
+read-only installs (e.g. a distribution package in `/usr/bin`) are never overwritten; they only
+get a notice.
+
+The release binary is built on Arch Linux against **FFmpeg 9 (libavcodec 63)**, PipeWire 1.x and
+libva 2. With other FFmpeg versions, build from source: the bindings are generated at build
+time, so a source build always matches the system FFmpeg.
 
 On the very first start KWin may not yet know the launcher entry. If the overlay says "screen
 capture not permitted", run `rust-screen-recorder ctl quit` and start it once more.
@@ -110,7 +127,7 @@ based on the `X-KDE-Wayland-Interfaces` key in that file, and checks it against 
 ## CLI
 
 ```
-rust-screen-recorder daemon | settings | overlay | install | uninstall
+rust-screen-recorder daemon | settings | overlay | install | uninstall | update | upload <file>
 rust-screen-recorder ctl save-replay | toggle-replay | toggle-recording | toggle-overlay | status | reload | quit
 ```
 

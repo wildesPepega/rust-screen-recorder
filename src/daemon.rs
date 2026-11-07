@@ -77,11 +77,50 @@ struct Daemon {
 }
 
 pub fn run() -> Result<()> {
+    let update_note = startup_update();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    rt.block_on(async_main())
+    rt.block_on(async_main(update_note))
 }
 
-async fn async_main() -> Result<()> {
+/// Auto-update before anything is captured. Returns a message for the user (toast).
+fn startup_update() -> Option<(ToastKind, String, String)> {
+    use crate::updater::{self, Outcome};
+    if let Ok(from) = std::env::var(updater::ENV_UPDATED_FROM) {
+        // We are the freshly installed version (re-executed after the update).
+        unsafe { std::env::remove_var(updater::ENV_UPDATED_FROM) };
+        return Some((ToastKind::Success, format!("Updated to v{}", updater::CURRENT), format!("Rust Screen Recorder was updated from v{from}")));
+    }
+    if !Config::load().general.auto_update || std::env::var_os("RSR_NO_UPDATE").is_some() {
+        return None;
+    }
+    let exe = crate::self_exe();
+    match updater::check_and_install(&exe) {
+        Ok(Outcome::UpToDate) => {
+            log::info!("up to date (v{})", updater::CURRENT);
+            None
+        }
+        Ok(Outcome::Available(tag, why)) => {
+            log::info!("update {tag} available but not installed: {why}");
+            Some((ToastKind::Info, format!("Update {tag} available"), format!("Not installed automatically: {why}")))
+        }
+        Ok(Outcome::Installed(tag)) => {
+            log::info!("installed {tag} – restarting");
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .env(updater::ENV_UPDATED_FROM, updater::CURRENT)
+                .exec();
+            log::error!("could not restart into the new version: {err}");
+            Some((ToastKind::Info, format!("Updated to {tag}"), "Restart Rust Screen Recorder to use the new version".into()))
+        }
+        Err(e) => {
+            log::warn!("update check failed: {e:#}");
+            None
+        }
+    }
+}
+
+async fn async_main(update_note: Option<(ToastKind, String, String)>) -> Result<()> {
     if !crate::encoders::ffmpeg_available() {
         return Err(anyhow!("ffmpeg was not found in PATH – please install ffmpeg"));
     }
@@ -227,12 +266,16 @@ async fn async_main() -> Result<()> {
         .await;
     }
 
+    if let Some((kind, title, body)) = &update_note {
+        d.notify(*kind, title, body).await;
+    } else {
     d.notify(
         ToastKind::Info,
         "Rust Screen Recorder is running",
         &format!("{} opens the overlay with all settings", d.cfg.hotkeys.toggle_overlay),
     )
     .await;
+    }
 
     // Desktop/Region mode: start replay right away.
     if d.cfg.replay.auto_start && matches!(d.cfg.general.capture_mode, CaptureMode::Desktop | CaptureMode::Region | CaptureMode::Auto) {

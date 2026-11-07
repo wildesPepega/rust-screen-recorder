@@ -507,6 +507,9 @@ impl SettingsEditor {
             ui.label("GPU");
             ui.checkbox(&mut g.zero_copy, "Zero-copy GPU capture & encoding (VA-API) – lowest CPU load");
             ui.end_row();
+            ui.label("Updates");
+            ui.checkbox(&mut g.auto_update, format!("Check for updates at every start and install them automatically (current: v{})", crate::updater::CURRENT));
+            ui.end_row();
             ui.label("Autostart");
             ui.checkbox(&mut g.autostart, "Start in the background when I log in");
             ui.end_row();
@@ -774,6 +777,9 @@ impl SettingsEditor {
             return;
         };
         Grid::new("status").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+            ui.label("Version");
+            ui.label(format!("v{}", crate::updater::CURRENT));
+            ui.end_row();
             ui.label("KWin screencast");
             if st.screencast_available {
                 ui.label(RichText::new("available (portal-free)").color(ACCENT));

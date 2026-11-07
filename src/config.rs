@@ -351,6 +351,8 @@ pub struct GeneralSettings {
     pub autostart: bool,
     /// Zero-copy GPU capture + encoding (DMA-BUF → VA-API) when the encoder is VA-API.
     pub zero_copy: bool,
+    /// Check GitHub for a new release at every start and install it automatically.
+    pub auto_update: bool,
 }
 
 impl Default for GeneralSettings {
@@ -367,6 +369,7 @@ impl Default for GeneralSettings {
             region_h: 720,
             autostart: false,
             zero_copy: true,
+            auto_update: true,
         }
     }
 }
