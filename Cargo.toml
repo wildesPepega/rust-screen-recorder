@@ -1,0 +1,47 @@
+[package]
+name = "rust-screen-recorder"
+version = "0.1.0"
+edition = "2024"
+description = "ShadowPlay-style instant replay, game and screen recording for KDE Plasma (Wayland) – portal-free, zero-copy VA-API"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/wildesPepega/rust-screen-recorder"
+readme = "README.md"
+keywords = ["screen-recorder", "instant-replay", "kde", "wayland", "vaapi"]
+categories = ["multimedia::video"]
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1.0.104"
+chrono = "0.4.45"
+crossbeam-channel = "0.5.17"
+dirs = "7.0.0"
+eframe = "0.33"
+egui = "0.33"
+env_logger = "0.11.11"
+futures-util = "0.3.34"
+ksni = "0.3.7"
+libc = "0.2.191"
+log = "0.4.35"
+parking_lot = "0.13.0"
+pipewire = "0.10.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "multipart", "rustls-tls", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny-skia = "0.11"
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+wayland-backend = "0.3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-scanner = "0.31"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3.34"
+
+[profile.release]
+strip = true
+lto = "thin"
