@@ -2,6 +2,17 @@
 
 ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (Wayland)**, written in Rust.
 
+![Overlay (Alt+Z)](docs/screenshots/overview.png)
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Instant Replay settings](docs/screenshots/settings-replay.png) **Instant Replay settings** | ![Recording settings](docs/screenshots/settings-recording.png) **Recording settings** |
+| ![Video overlays](docs/screenshots/settings-overlay.png) **Video overlays** | ![General](docs/screenshots/settings-general.png) **Global Settings → General** |
+| ![Hotkeys](docs/screenshots/settings-hotkeys.png) **Hotkeys** | ![Games](docs/screenshots/settings-games.png) **Games** |
+| ![Status](docs/screenshots/settings-status.png) **Status** | |
+
 ## Highlights
 
 - **No portal dialog, ever.** Capture uses KWin's privileged `zkde_screencast_unstable_v1`
