@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub enum Output {
     File(PathBuf),
@@ -373,14 +373,12 @@ impl ReplaySession {
         list_segments(&self.dir)
     }
 
-    fn keep_count(&self) -> usize {
-        (self.duration_secs as f32 / SEGMENT_SECS).ceil() as usize + 1
-    }
-
-    /// Delete segments that are older than the replay window.
+    /// Delete segments that are older than the replay window. Kept: everything a clip can need
+    /// (the window itself, one segment before it for its start time, the one being written)
+    /// plus some slack for segments that are shorter than `SEGMENT_SECS`.
     pub fn cleanup(&self) {
         let segs = self.segments();
-        let keep = self.keep_count() + 1;
+        let keep = (self.duration_secs as f32 / SEGMENT_SECS).ceil() as usize + 5;
         if segs.len() > keep {
             for p in &segs[..segs.len() - keep] {
                 let _ = std::fs::remove_file(p);
@@ -389,45 +387,41 @@ impl ReplaySession {
     }
 
     /// Snapshot the current ring buffer into a job that can run in the background.
+    ///
+    /// The clip covers exactly the last `duration_secs` before this call. The segment FFmpeg is
+    /// still writing is not touched here: its file is flushed in large blocks that end in the
+    /// middle of a frame. The job waits until FFmpeg has finished it (at most one segment length).
     pub fn snapshot(&self, out: PathBuf) -> Result<SaveJob> {
+        let press = unix_secs(SystemTime::now());
         let segs = self.segments();
-        if segs.is_empty() {
+        let Some((current, complete)) = segs.split_last() else {
             return Err(anyhow!("the replay buffer is still empty"));
-        }
-        // Pick just enough segments: the newest one is still being written; its length is the
-        // time since the previous segment was finished. All others are SEGMENT_SECS long.
-        let want = self.duration_secs as f32;
-        let now = std::time::SystemTime::now();
-        let partial = if segs.len() >= 2 {
-            std::fs::metadata(&segs[segs.len() - 2])
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| now.duration_since(t).ok())
-                .map(|d| d.as_secs_f32())
-                .unwrap_or(SEGMENT_SECS)
-        } else {
-            self.enc.started.elapsed().as_secs_f32()
         };
-        let mut have = partial;
-        let mut n = 1;
-        while have + 0.05 < want && n < segs.len() {
-            have += SEGMENT_SECS;
-            n += 1;
-        }
-        let chosen = segs[segs.len() - n..].to_vec();
+        // A segment is closed the moment the next one starts, so the modification times of the
+        // finished segments are the segment boundaries on the wall clock.
+        let closes = complete
+            .iter()
+            .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).map(unix_secs))
+            .collect::<std::io::Result<Vec<f64>>>()
+            .context("reading the replay buffer")?;
+        let first_start = match closes.first() {
+            Some(c) => c - SEGMENT_SECS as f64,
+            None => press - self.enc.started.elapsed().as_secs_f64(),
+        };
+        let plan = plan_clip(&closes, first_start, press, self.duration_secs as f64);
         // Hard-link (or copy) the segments so the ring buffer can keep rotating while we mux.
         let tmp = self.dir.join(format!("save-{}", chrono::Local::now().format("%H%M%S%3f")));
         std::fs::create_dir_all(&tmp)?;
         let mut files = vec![];
-        for p in chosen {
-            let dst = tmp.join(p.file_name().unwrap());
-            if std::fs::hard_link(&p, &dst).is_err() {
-                std::fs::copy(&p, &dst)?;
-            }
-            files.push(dst);
+        for p in &complete[plan.first.min(complete.len())..] {
+            files.push(link_into(p, &tmp)?);
         }
         Ok(SaveJob {
             files,
+            pending: current.clone(),
+            dir: self.dir.clone(),
+            offset: plan.offset,
+            duration: plan.duration,
             tmp,
             out,
             codec: self.enc.codec,
@@ -455,8 +449,50 @@ pub fn list_segments(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+fn unix_secs(t: SystemTime) -> f64 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+fn link_into(p: &Path, dir: &Path) -> Result<PathBuf> {
+    let dst = dir.join(p.file_name().unwrap());
+    if std::fs::hard_link(p, &dst).is_err() {
+        std::fs::copy(p, &dst).with_context(|| format!("copy {}", p.display()))?;
+    }
+    Ok(dst)
+}
+
+/// The part of the ring buffer a clip is cut from.
+#[derive(Debug, PartialEq)]
+struct ClipPlan {
+    /// Index of the first segment to use (`closes.len()` = the segment still being written).
+    first: usize,
+    /// Seconds to skip at the start of that segment.
+    offset: f64,
+    /// Length of the clip in seconds.
+    duration: f64,
+}
+
+/// Find the last `want` seconds before `press`. `closes[i]` is the time segment `i` was finished
+/// (= the time segment `i + 1` started), `first_start` the time segment 0 started.
+fn plan_clip(closes: &[f64], first_start: f64, press: f64, want: f64) -> ClipPlan {
+    let start_of = |i: usize| if i == 0 { first_start } else { closes[i - 1] };
+    let clip_start = press - want;
+    let first = (0..=closes.len()).rev().find(|i| start_of(*i) <= clip_start).unwrap_or(0);
+    let offset = (clip_start - start_of(first)).max(0.0);
+    let duration = (press - start_of(first) - offset).clamp(0.0, want);
+    ClipPlan { first, offset, duration }
+}
+
 pub struct SaveJob {
+    /// Finished segments (already linked into `tmp`).
     files: Vec<PathBuf>,
+    /// The segment that was still being written when the clip was requested.
+    pending: PathBuf,
+    /// The ring buffer directory.
+    dir: PathBuf,
+    /// Seconds to skip at the start of the first segment.
+    offset: f64,
+    duration: f64,
     tmp: PathBuf,
     pub out: PathBuf,
     codec: Codec,
@@ -465,13 +501,39 @@ pub struct SaveJob {
 }
 
 impl SaveJob {
-    /// Concatenate the segments without re-encoding (blocking, a fraction of a second).
-    pub fn run(self) -> Result<PathBuf> {
+    /// Concatenate the segments without re-encoding (blocking; waits for the running segment).
+    pub fn run(mut self) -> Result<PathBuf> {
         let r = self.run_inner();
         let _ = std::fs::remove_dir_all(&self.tmp);
         r
     }
-    fn run_inner(&self) -> Result<PathBuf> {
+
+    /// Wait until FFmpeg has finished the segment that was being written (it is closed before
+    /// the next one is created). Returns false if that never happens (encoder stopped).
+    fn wait_for_pending(&self) -> bool {
+        let name = self.pending.file_name().map(|n| n.to_os_string());
+        let deadline = Instant::now() + Duration::from_secs_f32(SEGMENT_SECS * 3.0);
+        loop {
+            if list_segments(&self.dir).last().and_then(|p| p.file_name()).map(|n| n.to_os_string()) > name {
+                return true;
+            }
+            if Instant::now() > deadline || !self.pending.exists() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn run_inner(&mut self) -> Result<PathBuf> {
+        if self.wait_for_pending() {
+            let f = link_into(&self.pending, &self.tmp)?;
+            self.files.push(f);
+        } else {
+            log::warn!("the newest replay segment was never finished – saving without it");
+        }
+        if self.files.is_empty() {
+            return Err(anyhow!("the replay buffer is still empty"));
+        }
         if let Some(d) = self.out.parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -482,9 +544,25 @@ impl SaveJob {
         }
         std::fs::write(&list, s)?;
         let mut cmd = encoders::ffmpeg_cmd();
-        cmd.args(["-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i"]);
+        cmd.args(["-loglevel", "error", "-y"]);
+        // Video can only be cut at keyframes without re-encoding. MP4/MOV get the frames between
+        // the keyframe and the real start as hidden pre-roll (negative timestamps → edit list), so
+        // the clip plays from the exact position. Other containers cannot hide frames: there the
+        // clip starts at the keyframe and is up to one keyframe interval longer.
+        let exact_start = self.offset > 0.001 && matches!(self.container, Container::Mp4 | Container::Mov);
+        if exact_start {
+            cmd.args(["-itsoffset", &format!("-{:.3}", self.offset)]);
+        }
+        cmd.args(["-f", "concat", "-safe", "0", "-i"]);
         cmd.arg(&list);
-        cmd.args(["-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero"]);
+        cmd.args(["-map", "0", "-c", "copy"]);
+        let length = if exact_start {
+            self.duration
+        } else {
+            cmd.args(["-avoid_negative_ts", "make_zero"]);
+            self.offset + self.duration
+        };
+        cmd.args(["-t", &format!("{length:.3}")]);
         cmd.args(encoders::muxer_args(self.container, self.codec, false));
         for (i, t) in self.track_titles.iter().enumerate() {
             cmd.arg(format!("-metadata:s:a:{i}")).arg(format!("title={t}"));
@@ -507,4 +585,56 @@ pub fn probe_duration(p: &Path) -> Option<f64> {
         .output()
         .ok()?;
     String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Segments of 2 s: 0 = [100, 102), 1 = [102, 104), 2 = [104, 106), 3 (running) from 106.
+    const CLOSES: [f64; 3] = [102.0, 104.0, 106.0];
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn clip_is_exactly_the_wanted_length() {
+        // Pressed 0.5 s into the running segment, last 4 s wanted → starts 0.5 s into segment 1.
+        let p = plan_clip(&CLOSES, 100.0, 106.5, 4.0);
+        assert_eq!(p.first, 1);
+        assert!(close(p.offset, 0.5) && close(p.duration, 4.0), "{p:?}");
+    }
+
+    #[test]
+    fn clip_start_on_a_segment_boundary_needs_no_offset() {
+        let p = plan_clip(&CLOSES, 100.0, 106.0, 4.0);
+        assert_eq!(p.first, 1);
+        assert!(close(p.offset, 0.0) && close(p.duration, 4.0), "{p:?}");
+    }
+
+    #[test]
+    fn short_buffer_gives_everything_there_is() {
+        let p = plan_clip(&CLOSES, 100.0, 107.0, 60.0);
+        assert_eq!(p.first, 0);
+        assert!(close(p.offset, 0.0) && close(p.duration, 7.0), "{p:?}");
+    }
+
+    #[test]
+    fn clip_inside_the_running_segment() {
+        let p = plan_clip(&CLOSES, 100.0, 107.5, 1.0);
+        assert_eq!(p.first, 3);
+        assert!(close(p.offset, 0.5) && close(p.duration, 1.0), "{p:?}");
+        // No finished segment at all yet.
+        let p = plan_clip(&[], 100.0, 101.0, 60.0);
+        assert_eq!(p, ClipPlan { first: 0, offset: 0.0, duration: 1.0 });
+    }
+
+    #[test]
+    fn uneven_segments_are_measured_not_assumed() {
+        // Keyframe interval 1.5 s gives segments of 3 s and 1.5 s.
+        let p = plan_clip(&[103.0, 104.5, 106.0], 100.0, 106.2, 2.0);
+        assert_eq!(p.first, 1);
+        assert!(close(p.offset, 1.2) && close(p.duration, 2.0), "{p:?}");
+    }
 }

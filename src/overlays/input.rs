@@ -432,47 +432,101 @@ fn draw_key(pm: &mut Pixmap, st: &Style, x: f32, y: f32, w: f32, h: f32, down: b
 fn draw_mouse(pm: &mut Pixmap, st: &Style, ox: f32, oy: f32, s: &InputState) {
     let (w, h) = (2.6 * U, 4.2 * U);
     let down = |c: KeyCode| s.pressed.contains(&c.code());
-    // body
-    let dark = paint(40, 44, 52, 240);
-    let body = rounded(ox, oy, w, h, w * 0.45);
-    pm.fill_path(&body, &st.idle, FillRule::Winding, Transform::identity(), None);
-    pm.stroke_path(&body, &st.border, &Stroke { width: 1.2, ..Default::default() }, Transform::identity(), None);
-    // buttons (top 40 %)
-    let bh = h * 0.4;
-    let half = w / 2.0;
-    let lb = rounded(ox + 3.0, oy + 3.0, half - 4.5, bh, 14.0);
-    let rb = rounded(ox + half + 1.5, oy + 3.0, half - 4.5, bh, 14.0);
-    pm.fill_path(&lb, if down(KeyCode::BTN_LEFT) { &st.hot } else { &st.idle }, FillRule::Winding, Transform::identity(), None);
-    pm.fill_path(&rb, if down(KeyCode::BTN_RIGHT) { &st.hot } else { &st.idle }, FillRule::Winding, Transform::identity(), None);
-    pm.stroke_path(&lb, &st.border, &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
-    pm.stroke_path(&rb, &st.border, &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
-    // wheel
-    let (ww, wh) = (w * 0.16, bh * 0.55);
-    let (wx, wy) = (ox + half - ww / 2.0, oy + bh * 0.28);
-    let wheel = rounded(wx, wy, ww, wh, ww / 2.0);
-    pm.fill_path(&wheel, if down(KeyCode::BTN_MIDDLE) { &st.hot } else { &dark }, FillRule::Winding, Transform::identity(), None);
-    pm.stroke_path(&wheel, &st.border, &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
-    // scroll arrows
-    let flash = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < SCROLL_FLASH);
-    let tri = |pm: &mut Pixmap, up: bool, on: bool| {
-        let cx = wx + ww / 2.0;
-        let (ty, dir) = if up { (wy - 5.0, -1.0) } else { (wy + wh + 5.0, 1.0) };
-        let mut pb = PathBuilder::new();
-        pb.move_to(cx - 7.0, ty);
-        pb.line_to(cx + 7.0, ty);
-        pb.line_to(cx, ty + dir * 8.0);
-        pb.close();
-        let p = if on { st.hot.clone() } else { paint(255, 255, 255, 60) };
-        pm.fill_path(&pb.finish().unwrap(), &p, FillRule::Winding, Transform::identity(), None);
-    };
-    tri(pm, true, flash(s.wheel_up));
-    tri(pm, false, flash(s.wheel_down));
-    // side buttons (left edge): forward (extra) above back (side)
-    for (code, y) in [(KeyCode::BTN_EXTRA, 0.47), (KeyCode::BTN_SIDE, 0.62)] {
-        let sb = rounded(ox - 7.0, oy + h * y, 12.0, h * 0.12, 4.0);
-        pm.fill_path(&sb, if down(code) { &st.hot } else { &dark }, FillRule::Winding, Transform::identity(), None);
-        pm.stroke_path(&sb, &st.border, &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
+    let id = Transform::identity();
+    let line = |width: f32| Stroke { width, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+    let dark = paint(8, 9, 12, 235);
+    let (cx, top) = (ox + w / 2.0, oy);
+
+    // Side buttons sit behind the body and stick out on the left: forward (extra) above back (side).
+    for (code, y) in [(KeyCode::BTN_EXTRA, 0.40), (KeyCode::BTN_SIDE, 0.535)] {
+        let sb = rounded(ox - 6.5, oy + h * y, 16.0, h * 0.115, 5.0);
+        pm.fill_path(&sb, if down(code) { &st.hot } else { &st.idle }, FillRule::Winding, id, None);
+        pm.stroke_path(&sb, &st.border, &line(1.2), id, None);
     }
+
+    // Body: narrow shoulders at the top, widest below the buttons, round palm rest.
+    let body = {
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx, top);
+        pb.cubic_to(ox + w * 0.87, top, ox + w, oy + h * 0.13, ox + w, oy + h * 0.37);
+        pb.cubic_to(ox + w, oy + h * 0.80, ox + w * 0.81, oy + h, cx, oy + h);
+        pb.cubic_to(ox + w * 0.19, oy + h, ox, oy + h * 0.80, ox, oy + h * 0.37);
+        pb.cubic_to(ox, oy + h * 0.13, ox + w * 0.13, top, cx, top);
+        pb.close();
+        pb.finish().unwrap()
+    };
+    // The side buttons are translucent: clear what the body covers so nothing shines through.
+    let mut clear = Paint::default();
+    clear.anti_alias = true;
+    clear.blend_mode = tiny_skia::BlendMode::Clear;
+    pm.fill_path(&body, &clear, FillRule::Winding, id, None);
+    pm.fill_path(&body, &st.idle, FillRule::Winding, id, None);
+
+    // Everything on the body is clipped to its outline.
+    let mut mask = tiny_skia::Mask::new(pm.width(), pm.height()).unwrap();
+    mask.fill_path(&body, FillRule::Winding, true, id);
+
+    // The seam between the buttons and the palm rest sags slightly towards the middle.
+    let (seam_edge, seam_mid) = (oy + h * 0.415, oy + h * 0.455);
+    let gap = w * 0.022;
+    let button = |left: bool| {
+        let dir = if left { -1.0 } else { 1.0 };
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx + dir * gap, top - 2.0);
+        pb.line_to(cx + dir * (w / 2.0 + 2.0), top - 2.0);
+        pb.line_to(cx + dir * (w / 2.0 + 2.0), seam_edge);
+        pb.quad_to(cx + dir * w / 4.0, (seam_edge + 3.0 * seam_mid) / 4.0, cx + dir * gap, seam_mid);
+        pb.close();
+        pb.finish().unwrap()
+    };
+    for (code, left) in [(KeyCode::BTN_LEFT, true), (KeyCode::BTN_RIGHT, false)] {
+        if down(code) {
+            pm.fill_path(&button(left), &st.hot, FillRule::Winding, id, Some(&mask));
+        }
+    }
+    // Seams: between the buttons and below them.
+    let seam = paint(255, 255, 255, 70);
+    let mut pb = PathBuilder::new();
+    pb.move_to(ox - 2.0, seam_edge);
+    pb.quad_to(cx, 2.0 * seam_mid - seam_edge, ox + w + 2.0, seam_edge);
+    pb.move_to(cx, top);
+    pb.line_to(cx, seam_mid);
+    pm.stroke_path(&pb.finish().unwrap(), &seam, &line(1.4), id, Some(&mask));
+
+    // Scroll wheel in its slot, with grip ridges.
+    let (ww, wh) = (w * 0.15, h * 0.165);
+    let (wx, wy) = (cx - ww / 2.0, oy + h * 0.125);
+    let slot = rounded(wx - 4.0, wy - 4.0, ww + 8.0, wh + 8.0, ww / 2.0 + 4.0);
+    pm.fill_path(&slot, &clear, FillRule::Winding, id, None);
+    pm.fill_path(&slot, &dark, FillRule::Winding, id, None);
+    let wheel = rounded(wx, wy, ww, wh, ww / 2.0);
+    let wheel_down = down(KeyCode::BTN_MIDDLE);
+    let wheel_idle = paint(78, 84, 96, 255);
+    pm.fill_path(&wheel, if wheel_down { &st.hot } else { &wheel_idle }, FillRule::Winding, id, None);
+    let ridge = if wheel_down { paint(0x10, 0x12, 0x16, 200) } else { paint(255, 255, 255, 80) };
+    let mut pb = PathBuilder::new();
+    for i in 1..=3 {
+        let y = wy + wh * i as f32 / 4.0;
+        pb.move_to(wx + 3.5, y);
+        pb.line_to(wx + ww - 3.5, y);
+    }
+    pm.stroke_path(&pb.finish().unwrap(), &ridge, &line(1.3), id, None);
+
+    // Scroll direction: chevrons above and below the wheel light up while scrolling.
+    let flash = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < SCROLL_FLASH);
+    for (up, on) in [(true, flash(s.wheel_up)), (false, flash(s.wheel_down))] {
+        let (tip, dir) = if up { (wy - 13.0, 1.0) } else { (wy + wh + 13.0, -1.0) };
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - 6.5, tip + dir * 5.5);
+        pb.line_to(cx, tip);
+        pb.line_to(cx + 6.5, tip + dir * 5.5);
+        let p = if on { st.hot.clone() } else { paint(255, 255, 255, 70) };
+        // On a pressed (green) button the idle chevron would vanish: draw a dark backing first.
+        pm.stroke_path(&pb.clone().finish().unwrap(), &paint(8, 9, 12, if on { 200 } else { 0 }), &line(4.6), id, None);
+        pm.stroke_path(&pb.finish().unwrap(), &p, &line(2.4), id, None);
+    }
+
+    pm.stroke_path(&body, &st.border, &line(1.5), id, None);
 }
 
 /// Draw the overlay for `s` (also used for the preview in the settings).

@@ -88,11 +88,145 @@ pub struct SettingsEditor {
     /// Overlay tab state.
     ov_sel: Corner,
     ov_input_tex: Option<(InputOverlay, egui::TextureHandle, [usize; 2])>,
-    ov_web_job: Option<(Corner, Receiver<Result<crate::overlays::Image, String>>)>,
-    ov_web_tex: Option<(Corner, String, egui::TextureHandle, [usize; 2])>,
-    ov_web_err: Option<String>,
-    ov_drag: Option<egui::Pos2>,
+    ov_pad_tex: Option<(ControllerOverlay, egui::TextureHandle, [usize; 2])>,
+    /// Live picture of the selected website overlay.
+    ov_web: Option<WebPreview>,
+    /// Page settings the preview should show, and since when (restart only once typing stopped).
+    ov_web_want: Option<(WebsiteOverlay, std::time::Instant)>,
+    ov_drag: Option<CropDrag>,
     ov_access: bool,
+}
+
+/// A headless browser rendering the whole page of one website overlay for the editor.
+struct WebPreview {
+    corner: Corner,
+    /// What is being rendered (cut-out removed, preview frame rate).
+    cfg: WebsiteOverlay,
+    slot: std::sync::Arc<crate::overlays::Slot>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
+    /// Version of the frame that is in `tex`.
+    version: u64,
+    tex: Option<(egui::TextureHandle, [usize; 2])>,
+}
+
+impl WebPreview {
+    /// The part of an overlay's settings that changes what the browser renders.
+    fn page_of(w: &WebsiteOverlay) -> WebsiteOverlay {
+        WebsiteOverlay { crop_x: 0, crop_y: 0, crop_w: 0, crop_h: 0, fps: 10, url: w.url.trim().to_string(), ..w.clone() }
+    }
+
+    fn start(corner: Corner, cfg: WebsiteOverlay) -> WebPreview {
+        let slot = std::sync::Arc::new(crate::overlays::Slot::default());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let (c2, s2, st2, e2) = (cfg.clone(), slot.clone(), stop.clone(), error.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = crate::overlays::web::run(&c2, &s2, &st2) {
+                *e2.lock() = Some(format!("{e:#}"));
+            }
+        });
+        WebPreview { corner, cfg, slot, stop, error, version: 0, tex: None }
+    }
+
+    /// Take over a new frame, if there is one.
+    fn update(&mut self, ctx: &egui::Context) {
+        if let Some((img, version)) = self.slot.get() {
+            if version != self.version || self.tex.is_none() {
+                let tex = ctx.load_texture("web-preview", to_color_image(&img), egui::TextureOptions::LINEAR);
+                self.tex = Some((tex, [img.w as usize, img.h as usize]));
+                self.version = version;
+            }
+        }
+    }
+}
+
+impl Drop for WebPreview {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Cut-out of a website overlay in page pixels.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Crop {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+/// What a drag on the page preview does to the cut-out.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CropGrab {
+    /// Draw a new rectangle.
+    New,
+    Move,
+    /// Pull the named edges (a corner pulls two).
+    Resize { left: bool, right: bool, top: bool, bottom: bool },
+}
+
+#[derive(Clone, Copy)]
+struct CropDrag {
+    grab: CropGrab,
+    /// Pointer position (page pixels) and cut-out when the drag started.
+    start: (f32, f32),
+    orig: Option<Crop>,
+}
+
+const CROP_MIN: f32 = 8.0;
+
+/// What would a drag starting at `p` grab? `tol` = how close to an edge counts as on it.
+fn crop_grab(crop: Option<Crop>, p: (f32, f32), tol: f32) -> CropGrab {
+    let Some(c) = crop else { return CropGrab::New };
+    let (x1, y1) = (c.x + c.w, c.y + c.h);
+    if p.0 < c.x - tol || p.0 > x1 + tol || p.1 < c.y - tol || p.1 > y1 + tol {
+        return CropGrab::New;
+    }
+    // On a small rectangle the edge zones must not swallow the whole inside.
+    let (tx, ty) = (tol.min(c.w / 3.0), tol.min(c.h / 3.0));
+    let (left, right) = (p.0 < c.x + tx, p.0 > x1 - tx);
+    let (top, bottom) = (p.1 < c.y + ty, p.1 > y1 - ty);
+    if left || right || top || bottom {
+        CropGrab::Resize { left, right, top, bottom }
+    } else {
+        CropGrab::Move
+    }
+}
+
+/// The cut-out after dragging from `d.start` to `now`, kept inside the page.
+fn crop_drag(d: &CropDrag, now: (f32, f32), page: (f32, f32)) -> Option<Crop> {
+    let clamp = |v: f32, max: f32| v.clamp(0.0, max);
+    let (nx, ny) = (clamp(now.0, page.0), clamp(now.1, page.1));
+    match (d.grab, d.orig) {
+        (CropGrab::Move, Some(o)) => Some(Crop {
+            x: clamp(o.x + now.0 - d.start.0, (page.0 - o.w).max(0.0)),
+            y: clamp(o.y + now.1 - d.start.1, (page.1 - o.h).max(0.0)),
+            ..o
+        }),
+        (CropGrab::Resize { left, right, top, bottom }, Some(o)) => {
+            let (mut x0, mut y0, mut x1, mut y1) = (o.x, o.y, o.x + o.w, o.y + o.h);
+            if left {
+                x0 = nx.min(x1 - CROP_MIN);
+            }
+            if right {
+                x1 = nx.max(x0 + CROP_MIN);
+            }
+            if top {
+                y0 = ny.min(y1 - CROP_MIN);
+            }
+            if bottom {
+                y1 = ny.max(y0 + CROP_MIN);
+            }
+            Some(Crop { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+        }
+        _ => {
+            let (sx, sy) = (clamp(d.start.0, page.0), clamp(d.start.1, page.1));
+            let c = Crop { x: sx.min(nx), y: sy.min(ny), w: (sx - nx).abs(), h: (sy - ny).abs() };
+            // A click without a real drag keeps the old cut-out.
+            if c.w >= CROP_MIN && c.h >= CROP_MIN { Some(c) } else { d.orig }
+        }
+    }
 }
 
 impl SettingsEditor {
@@ -111,9 +245,9 @@ impl SettingsEditor {
             show_token: false,
             ov_sel: Corner::BottomLeft,
             ov_input_tex: None,
-            ov_web_job: None,
-            ov_web_tex: None,
-            ov_web_err: None,
+            ov_pad_tex: None,
+            ov_web: None,
+            ov_web_want: None,
             ov_drag: None,
             ov_access: crate::overlays::input::has_access(),
         }
@@ -193,6 +327,9 @@ impl SettingsEditor {
             });
         }
 
+        if self.tab != Tab::Overlay {
+            self.stop_previews();
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin::same(10))).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.tab {
                 Tab::General => self.general_tab(ui, st),
@@ -670,23 +807,7 @@ impl SettingsEditor {
     }
 
     fn overlay_tab(&mut self, ui: &mut egui::Ui) {
-        // Finished website screenshot?
-        if let Some((corner, rx)) = &self.ov_web_job {
-            match rx.try_recv() {
-                Ok(Ok(img)) => {
-                    let url = self.cfg.overlays.slot(*corner).website.url.clone();
-                    let tex = ui.ctx().load_texture("web-shot", to_color_image(&img), egui::TextureOptions::LINEAR);
-                    self.ov_web_tex = Some((*corner, url, tex, [img.w as usize, img.h as usize]));
-                    self.ov_web_err = None;
-                    self.ov_web_job = None;
-                }
-                Ok(Err(e)) => {
-                    self.ov_web_err = Some(e);
-                    self.ov_web_job = None;
-                }
-                Err(_) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(150)),
-            }
-        }
+        self.sync_web_preview(ui.ctx());
 
         ui.heading("Overlay");
         ui.label(
@@ -710,6 +831,7 @@ impl SettingsEditor {
         painter.rect_filled(stand, 3.0, egui::Color32::from_rgb(0x0c, 0x0d, 0x10));
 
         self.ensure_input_preview(ui.ctx());
+        self.ensure_controller_preview(ui.ctx());
         let enabled = self.cfg.overlays.enabled;
         for corner in Corner::ALL {
             let slot = self.cfg.overlays.slot(corner).clone();
@@ -734,12 +856,16 @@ impl SettingsEditor {
                 let tint = egui::Color32::from_white_alpha(((if enabled { 255.0 } else { 110.0 }) * slot.opacity) as u8);
                 let textured = match slot.kind {
                     OverlayKind::Input => self.ov_input_tex.as_ref().map(|(_, t, _)| t.id()),
-                    OverlayKind::Website => self.ov_web_tex.as_ref().filter(|(c, u, _, _)| *c == corner && *u == slot.website.url).map(|(_, _, t, _)| t.id()),
+                    OverlayKind::Controller => self.ov_pad_tex.as_ref().filter(|(c, _, _)| *c == slot.controller).map(|(_, t, _)| t.id()),
+                    OverlayKind::Website => self.ov_web.as_ref().filter(|p| p.corner == corner).and_then(|p| p.tex.as_ref()).map(|(t, _)| t.id()),
                     _ => None,
                 };
                 match textured {
                     Some(id) => {
                         let uv = if slot.kind == OverlayKind::Website { self.crop_uv(&slot) } else { egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)) };
+                        if slot.kind == OverlayKind::Website && !slot.website.transparent {
+                            painter.rect_filled(r, 0.0, egui::Color32::WHITE.gamma_multiply(tint.a() as f32 / 255.0));
+                        }
                         painter.image(id, r, uv, tint);
                     }
                     None => {
@@ -791,7 +917,7 @@ impl SettingsEditor {
         }
         Grid::new("ov-common").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
             ui.label("Size");
-            ui.add(Slider::new(&mut slot.size_percent, 5.0..=60.0).suffix(" % of the video width"));
+            ui.add(Slider::new(&mut slot.size_percent, 2.0..=100.0).fixed_decimals(1).suffix(" % of the video width"));
             ui.end_row();
             ui.label("Opacity");
             let mut op = slot.opacity * 100.0;
@@ -800,7 +926,7 @@ impl SettingsEditor {
             }
             ui.end_row();
             ui.label("Distance to the edge");
-            ui.add(Slider::new(&mut slot.margin_percent, 0.0..=10.0).suffix(" %"));
+            ui.add(Slider::new(&mut slot.margin_percent, 0.0..=30.0).fixed_decimals(1).suffix(" % of the video height"));
             ui.end_row();
         });
         ui.add_space(6.0);
@@ -860,46 +986,88 @@ impl SettingsEditor {
                 }
             }
             OverlayKind::Website => {
-                let mut load = false;
+                let w = &mut slot.website;
+                let mut reload = false;
                 Grid::new("ov-web").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     ui.label("URL");
-                    ui.add(egui::TextEdit::singleline(&mut slot.website.url).hint_text("https://… (alerts, chat, widgets)").desired_width(420.0));
+                    ui.add(egui::TextEdit::singleline(&mut w.url).hint_text("https://… (alerts, chat, widgets)").desired_width(420.0));
                     ui.end_row();
                     ui.label("Page size");
                     ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut slot.website.page_width).range(200..=3840).suffix(" px"));
+                        ui.add(DragValue::new(&mut w.page_width).range(200..=3840).suffix(" px"));
                         ui.label("×");
-                        ui.add(DragValue::new(&mut slot.website.page_height).range(100..=2160).suffix(" px"));
-                    });
+                        ui.add(DragValue::new(&mut w.page_height).range(100..=2160).suffix(" px"));
+                        for (pw, ph) in [(1920, 1080), (1280, 720), (800, 600)] {
+                            if ui.selectable_label(w.page_width == pw && w.page_height == ph, format!("{pw}×{ph}")).clicked() {
+                                w.page_width = pw;
+                                w.page_height = ph;
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("The browser window the page is rendered in. The cut-out below is measured in these pixels.");
+                    ui.end_row();
+                    ui.label("Zoom");
+                    ui.add(Slider::new(&mut w.zoom_percent, 25..=400).suffix(" %"))
+                        .on_hover_text("Makes the page content bigger or smaller, like Ctrl + / Ctrl − in a browser.");
+                    ui.end_row();
+                    ui.label("Update rate");
+                    ui.add(Slider::new(&mut w.fps, 1..=60).suffix(" fps"))
+                        .on_hover_text("How often the overlay may change per second. Lower values need less CPU; the page is only redrawn when it changes anyway.");
                     ui.end_row();
                     ui.label("Background");
-                    ui.checkbox(&mut slot.website.transparent, "Transparent page background");
+                    ui.checkbox(&mut w.transparent, "Transparent page background");
                     ui.end_row();
-                    ui.label("Editor");
+                    ui.label("Custom CSS");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut w.custom_css)
+                            .code_editor()
+                            .desired_rows(2)
+                            .desired_width(420.0)
+                            .hint_text("body { font-size: 20px }  .ad { display: none }"),
+                    )
+                    .on_hover_text("Extra styles for the page: hide elements, change fonts or colours.");
+                    ui.end_row();
+                    ui.label("Preview");
                     ui.horizontal(|ui| {
-                        load = ui.add_enabled(self.ov_web_job.is_none() && !slot.website.url.trim().is_empty(), egui::Button::new("Load page preview")).clicked();
-                        if self.ov_web_job.is_some() {
+                        let p = self.ov_web.as_ref().filter(|p| p.corner == corner);
+                        let err = p.and_then(|p| p.error.lock().clone());
+                        if w.url.trim().is_empty() {
+                            ui.label(RichText::new("Enter a URL to see the page.").color(TEXT_DIM));
+                        } else if let Some(e) = err {
+                            ui.label(RichText::new(e).color(RED));
+                        } else if p.is_some_and(|p| p.tex.is_some()) && self.ov_web_want.is_none() {
+                            ui.label(RichText::new("● live").color(ACCENT));
+                        } else {
                             ui.spinner();
                             ui.label("loading…");
                         }
+                        reload = ui.add_enabled(p.is_some(), egui::Button::new("Reload page")).clicked();
                     });
                     ui.end_row();
                 });
                 if crate::overlays::web::find_browser().is_none() {
                     ui.label(RichText::new("No Chromium-based browser found (Chromium, Chrome, Brave, Edge or Vivaldi is needed).").color(RED));
                 }
-                if let Some(e) = &self.ov_web_err {
-                    ui.label(RichText::new(e).color(RED));
-                }
-                if load {
-                    let cfg = slot.website.clone();
-                    let (tx, rx) = channel();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(crate::overlays::web::screenshot(&cfg).map_err(|e| format!("{e:#}")));
-                    });
-                    self.ov_web_job = Some((corner, rx));
+                if reload {
+                    self.ov_web = None;
                 }
                 self.website_editor(ui, corner);
+            }
+            OverlayKind::Controller => {
+                Grid::new("ov-pad").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                    ui.label("Controller");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut slot.controller.model, ControllerModel::Xbox, "Xbox");
+                        ui.radio_value(&mut slot.controller.model, ControllerModel::PlayStation, "PlayStation");
+                    });
+                    ui.end_row();
+                });
+                ui.label(
+                    RichText::new("Shows buttons, sticks and triggers of any connected controller. The model only changes the look – a PlayStation pad can be shown as an Xbox controller and the other way round.")
+                        .small()
+                        .color(TEXT_DIM),
+                );
             }
             OverlayKind::None => {}
         }
@@ -910,6 +1078,7 @@ impl SettingsEditor {
         match slot.kind {
             OverlayKind::Input => self.ov_input_tex.as_ref().map(|(_, _, s)| (s[0] as u32, s[1] as u32)).unwrap_or((700, 260)),
             OverlayKind::Webcam => (16, 9),
+            OverlayKind::Controller => self.ov_pad_tex.as_ref().map(|(_, _, s)| (s[0] as u32, s[1] as u32)).unwrap_or((560, 384)),
             OverlayKind::Website => {
                 let w = &slot.website;
                 if w.crop_w > 0 && w.crop_h > 0 {
@@ -945,81 +1114,163 @@ impl SettingsEditor {
         }
     }
 
-    /// Screenshot of the page with a draggable crop rectangle.
-    fn website_editor(&mut self, ui: &mut egui::Ui, corner: Corner) {
-        let Some((c, url, tex, size)) = &self.ov_web_tex else {
-            ui.label(RichText::new("Load the page preview to choose the visible part with the mouse.").small().color(TEXT_DIM));
-            return;
-        };
-        let slot = self.cfg.overlays.slot_mut(corner);
-        if *c != corner || *url != slot.website.url {
-            ui.label(RichText::new("Load the page preview again to edit this overlay.").small().color(TEXT_DIM));
+    fn ensure_controller_preview(&mut self, ctx: &egui::Context) {
+        let Some(slot) = Corner::ALL.iter().map(|c| self.cfg.overlays.slot(*c)).find(|s| s.kind == OverlayKind::Controller) else { return };
+        if self.ov_pad_tex.as_ref().is_some_and(|(c, _, _)| *c == slot.controller) {
             return;
         }
+        if let Some(img) = crate::overlays::controller::preview(&slot.controller) {
+            let tex = ctx.load_texture("controller-preview", to_color_image(&img), egui::TextureOptions::LINEAR);
+            self.ov_pad_tex = Some((slot.controller.clone(), tex, [img.w as usize, img.h as usize]));
+        }
+    }
+
+    /// Stop the website preview's browser (when the overlay tab is left).
+    pub fn stop_previews(&mut self) {
+        self.ov_web = None;
+        self.ov_web_want = None;
+    }
+
+    /// Keep the live website preview in step with the selected corner and its page settings.
+    fn sync_web_preview(&mut self, ctx: &egui::Context) {
+        let slot = self.cfg.overlays.slot(self.ov_sel);
+        let want = (slot.kind == OverlayKind::Website && !slot.website.url.trim().is_empty() && crate::overlays::web::find_browser().is_some())
+            .then(|| WebPreview::page_of(&slot.website));
+        let Some(want) = want else {
+            self.stop_previews();
+            return;
+        };
+        let corner = self.ov_sel;
+        if self.ov_web.as_ref().is_some_and(|p| p.corner == corner && p.cfg == want) {
+            self.ov_web_want = None;
+        } else {
+            // Start (or restart) once the settings have been stable for a moment, so typing a
+            // URL does not launch a browser per keystroke.
+            let now = std::time::Instant::now();
+            let since = match &self.ov_web_want {
+                Some((w, t)) if *w == want => *t,
+                _ => now,
+            };
+            let first = self.ov_web.is_none() && self.ov_web_want.is_none();
+            if first || now.duration_since(since) > std::time::Duration::from_millis(700) {
+                self.ov_web = Some(WebPreview::start(corner, want));
+                self.ov_web_want = None;
+            } else {
+                self.ov_web_want = Some((want, since));
+            }
+        }
+        if let Some(p) = &mut self.ov_web {
+            p.update(ctx);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// Live picture of the page with a cut-out that can be drawn, moved and resized.
+    fn website_editor(&mut self, ui: &mut egui::Ui, corner: Corner) {
+        let Some((tex, size)) = self.ov_web.as_ref().filter(|p| p.corner == corner).and_then(|p| p.tex.clone()) else { return };
         ui.add_space(4.0);
-        ui.label(RichText::new("Drag on the page to cut out the part that should be visible.").small().color(TEXT_DIM));
+        ui.label(
+            RichText::new("Drag on the page to cut out the visible part. Drag inside the frame to move it, drag its edges or corners to resize it.")
+                .small()
+                .color(TEXT_DIM),
+        );
         let (pw, ph) = (size[0] as f32, size[1] as f32);
-        let disp_w = ui.available_width().min(620.0);
+        let disp_w = ui.available_width().min(760.0);
         let disp_h = disp_w * ph / pw;
         let (resp, painter) = ui.allocate_painter(egui::vec2(disp_w, disp_h), egui::Sense::drag());
         let r = resp.rect;
-        // checkerboard so transparent parts are visible
-        let cell = 12.0;
-        let (nx, ny) = ((disp_w / cell).ceil() as i32, (disp_h / cell).ceil() as i32);
-        for iy in 0..ny {
-            for ix in 0..nx {
-                let col = if (ix + iy) % 2 == 0 { egui::Color32::from_gray(58) } else { egui::Color32::from_gray(42) };
-                let cr = egui::Rect::from_min_size(r.min + egui::vec2(ix as f32 * cell, iy as f32 * cell), egui::vec2(cell, cell)).intersect(r);
-                painter.rect_filled(cr, 0.0, col);
+        let slot = self.cfg.overlays.slot_mut(corner);
+        let w = &mut slot.website;
+        if w.transparent {
+            // checkerboard so transparent parts are visible
+            let cell = 12.0;
+            let (nx, ny) = ((disp_w / cell).ceil() as i32, (disp_h / cell).ceil() as i32);
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let col = if (ix + iy) % 2 == 0 { egui::Color32::from_gray(58) } else { egui::Color32::from_gray(42) };
+                    let cr = egui::Rect::from_min_size(r.min + egui::vec2(ix as f32 * cell, iy as f32 * cell), egui::vec2(cell, cell)).intersect(r);
+                    painter.rect_filled(cr, 0.0, col);
+                }
             }
+        } else {
+            painter.rect_filled(r, 0.0, egui::Color32::WHITE);
         }
         painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-        let to_page = |p: egui::Pos2| (((p.x - r.min.x) / disp_w * pw).clamp(0.0, pw), ((p.y - r.min.y) / disp_h * ph).clamp(0.0, ph));
+
+        let to_page = |p: egui::Pos2| ((p.x - r.min.x) / disp_w * pw, (p.y - r.min.y) / disp_h * ph);
+        let current = (w.crop_w > 0 && w.crop_h > 0).then(|| Crop { x: w.crop_x as f32, y: w.crop_y as f32, w: w.crop_w as f32, h: w.crop_h as f32 });
+        let tol = 9.0 * pw / disp_w;
         if resp.drag_started() {
-            self.ov_drag = resp.interact_pointer_pos();
+            if let Some(p) = resp.interact_pointer_pos() {
+                let start = to_page(p);
+                self.ov_drag = Some(CropDrag { grab: crop_grab(current, start, tol), start, orig: current });
+            }
         }
-        if let (Some(a), Some(b)) = (self.ov_drag, resp.interact_pointer_pos()) {
+        if let (Some(d), Some(p)) = (&self.ov_drag, resp.interact_pointer_pos()) {
             if resp.dragged() || resp.drag_stopped() {
-                let (ax, ay) = to_page(a);
-                let (bx, by) = to_page(b);
-                let (x0, y0, x1, y1) = (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by));
-                if x1 - x0 > 8.0 && y1 - y0 > 8.0 {
-                    slot.website.crop_x = x0 as u32;
-                    slot.website.crop_y = y0 as u32;
-                    slot.website.crop_w = (x1 - x0) as u32;
-                    slot.website.crop_h = (y1 - y0) as u32;
+                if let Some(c) = crop_drag(d, to_page(p), (pw, ph)) {
+                    w.crop_x = c.x.round() as u32;
+                    w.crop_y = c.y.round() as u32;
+                    w.crop_w = (c.w.round() as u32).max(1);
+                    w.crop_h = (c.h.round() as u32).max(1);
                 }
             }
         }
         if resp.drag_stopped() {
             self.ov_drag = None;
         }
-        // crop rectangle + dimmed outside
-        let w = &slot.website;
+        // Show what a drag would do.
+        let grab = self.ov_drag.map(|d| d.grab).or_else(|| resp.hover_pos().map(|p| crop_grab(current, to_page(p), tol)));
+        if let Some(g) = grab {
+            ui.ctx().set_cursor_icon(match g {
+                CropGrab::New => egui::CursorIcon::Crosshair,
+                CropGrab::Move => egui::CursorIcon::Move,
+                CropGrab::Resize { left, right, top, bottom } => match (left || right, top || bottom) {
+                    (true, false) => egui::CursorIcon::ResizeHorizontal,
+                    (false, true) => egui::CursorIcon::ResizeVertical,
+                    _ if (left && top) || (right && bottom) => egui::CursorIcon::ResizeNwSe,
+                    _ => egui::CursorIcon::ResizeNeSw,
+                },
+            });
+        }
+        // cut-out frame with handles, everything else dimmed
         if w.crop_w > 0 && w.crop_h > 0 {
             let cr = egui::Rect::from_min_size(
                 r.min + egui::vec2(w.crop_x as f32 / pw * disp_w, w.crop_y as f32 / ph * disp_h),
                 egui::vec2(w.crop_w as f32 / pw * disp_w, w.crop_h as f32 / ph * disp_h),
-            );
+            )
+            .intersect(r);
             let dim = egui::Color32::from_black_alpha(150);
             painter.rect_filled(egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, cr.min.y)), 0.0, dim);
             painter.rect_filled(egui::Rect::from_min_max(egui::pos2(r.min.x, cr.max.y), r.max), 0.0, dim);
             painter.rect_filled(egui::Rect::from_min_max(egui::pos2(r.min.x, cr.min.y), egui::pos2(cr.min.x, cr.max.y)), 0.0, dim);
             painter.rect_filled(egui::Rect::from_min_max(egui::pos2(cr.max.x, cr.min.y), egui::pos2(r.max.x, cr.max.y)), 0.0, dim);
             painter.rect_stroke(cr, 0.0, egui::Stroke::new(2.0_f32, ACCENT), egui::StrokeKind::Outside);
+            for (fx, fy) in [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (0.0, 0.5), (1.0, 0.5), (0.0, 1.0), (0.5, 1.0), (1.0, 1.0)] {
+                let c = egui::pos2(cr.min.x + cr.width() * fx, cr.min.y + cr.height() * fy);
+                let h = egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0));
+                painter.rect_filled(h, 2.0, ACCENT);
+                painter.rect_stroke(h, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::BLACK), egui::StrokeKind::Outside);
+            }
+            let label = format!("{} × {} px", w.crop_w, w.crop_h);
+            let below = cr.max.y + 20.0 < r.max.y;
+            let pos = if below { egui::pos2(cr.min.x + 2.0, cr.max.y + 4.0) } else { egui::pos2(cr.min.x + 6.0, cr.max.y - 20.0) };
+            let galley = painter.layout_no_wrap(label, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+            painter.rect_filled(egui::Rect::from_min_size(pos, galley.size()).expand(3.0), 3.0, egui::Color32::from_black_alpha(190));
+            painter.galley(pos, galley, egui::Color32::WHITE);
         }
-        let slot = self.cfg.overlays.slot_mut(corner);
+        let (pwu, phu) = (size[0] as u32, size[1] as u32);
         ui.horizontal(|ui| {
             ui.label("Cut-out");
-            ui.add(DragValue::new(&mut slot.website.crop_x).prefix("x "));
-            ui.add(DragValue::new(&mut slot.website.crop_y).prefix("y "));
-            ui.add(DragValue::new(&mut slot.website.crop_w).prefix("w "));
-            ui.add(DragValue::new(&mut slot.website.crop_h).prefix("h "));
+            ui.add(DragValue::new(&mut w.crop_x).range(0..=pwu.saturating_sub(1)).prefix("x ").suffix(" px"));
+            ui.add(DragValue::new(&mut w.crop_y).range(0..=phu.saturating_sub(1)).prefix("y ").suffix(" px"));
+            ui.add(DragValue::new(&mut w.crop_w).range(0..=pwu - w.crop_x.min(pwu)).prefix("w ").suffix(" px"));
+            ui.add(DragValue::new(&mut w.crop_h).range(0..=phu - w.crop_y.min(phu)).prefix("h ").suffix(" px"));
             if ui.button("Whole page").clicked() {
-                slot.website.crop_x = 0;
-                slot.website.crop_y = 0;
-                slot.website.crop_w = 0;
-                slot.website.crop_h = 0;
+                w.crop_x = 0;
+                w.crop_y = 0;
+                w.crop_w = 0;
+                w.crop_h = 0;
             }
         });
     }
@@ -1226,4 +1477,54 @@ fn to_color_image(img: &crate::overlays::Image) -> egui::ColorImage {
         p.swap(0, 2);
     }
     egui::ColorImage::from_rgba_unmultiplied([img.w as usize, img.h as usize], &rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const C: Crop = Crop { x: 100.0, y: 100.0, w: 200.0, h: 100.0 };
+    const PAGE: (f32, f32) = (1000.0, 500.0);
+
+    fn drag(grab: CropGrab, start: (f32, f32), now: (f32, f32)) -> Option<Crop> {
+        crop_drag(&CropDrag { grab, start, orig: Some(C) }, now, PAGE)
+    }
+
+    #[test]
+    fn grab_depends_on_where_the_drag_starts() {
+        assert_eq!(crop_grab(None, (10.0, 10.0), 8.0), CropGrab::New);
+        assert_eq!(crop_grab(Some(C), (500.0, 400.0), 8.0), CropGrab::New);
+        assert_eq!(crop_grab(Some(C), (200.0, 150.0), 8.0), CropGrab::Move);
+        assert_eq!(crop_grab(Some(C), (102.0, 150.0), 8.0), CropGrab::Resize { left: true, right: false, top: false, bottom: false });
+        // just outside the bottom right corner still grabs the corner
+        assert_eq!(crop_grab(Some(C), (304.0, 203.0), 8.0), CropGrab::Resize { left: false, right: true, top: false, bottom: true });
+    }
+
+    #[test]
+    fn tiny_cut_out_can_still_be_moved() {
+        let small = Crop { x: 100.0, y: 100.0, w: 12.0, h: 12.0 };
+        assert_eq!(crop_grab(Some(small), (106.0, 106.0), 8.0), CropGrab::Move);
+    }
+
+    #[test]
+    fn move_keeps_the_size_and_stays_on_the_page() {
+        assert_eq!(drag(CropGrab::Move, (200.0, 150.0), (230.0, 140.0)), Some(Crop { x: 130.0, y: 90.0, ..C }));
+        assert_eq!(drag(CropGrab::Move, (200.0, 150.0), (5000.0, -900.0)), Some(Crop { x: 800.0, y: 0.0, ..C }));
+    }
+
+    #[test]
+    fn resize_moves_only_the_grabbed_edges() {
+        let right = CropGrab::Resize { left: false, right: true, top: false, bottom: false };
+        assert_eq!(drag(right, (300.0, 150.0), (350.0, 480.0)), Some(Crop { w: 250.0, ..C }));
+        // an edge cannot cross the opposite one
+        assert_eq!(drag(right, (300.0, 150.0), (20.0, 150.0)), Some(Crop { w: CROP_MIN, ..C }));
+        let top_left = CropGrab::Resize { left: true, right: false, top: true, bottom: false };
+        assert_eq!(drag(top_left, (100.0, 100.0), (-50.0, 60.0)), Some(Crop { x: 0.0, y: 60.0, w: 300.0, h: 140.0 }));
+    }
+
+    #[test]
+    fn new_rectangle_works_in_any_direction_and_ignores_clicks() {
+        assert_eq!(drag(CropGrab::New, (600.0, 400.0), (500.0, 300.0)), Some(Crop { x: 500.0, y: 300.0, w: 100.0, h: 100.0 }));
+        assert_eq!(drag(CropGrab::New, (600.0, 400.0), (602.0, 401.0)), Some(C));
+    }
 }

@@ -32,8 +32,10 @@ ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (
 - **Clips per game.** Clips are saved to `<output>/<Game name>/…`. The name comes from the launcher's
   library (Steam appmanifest / non-Steam shortcuts, Lutris `GAME_NAME`, Heroic library cache,
   Faugus `games.json`).
-- **Instant replay** with a RAM (`/dev/shm`) or disk ring buffer. Saving is a lossless concat, so it
-  takes a fraction of a second.
+- **Instant replay** with a RAM (`/dev/shm`) or disk ring buffer. Saving is a lossless concat of
+  2 s segments. The clip ends at the moment you press the key (the recorder waits for the running
+  segment to be finished, at most 2 s) and is exactly as long as configured in MP4/MOV; other
+  containers start at the previous keyframe and can be up to one keyframe interval longer.
 - **Recording** with its own codec, preset and output folder, separate from instant replay.
 - **Zero-copy GPU pipeline (VA-API, AMD/Intel):** KWin hands out DMA-BUFs. They are imported into
   VA-API, then colour-converted, scaled and encoded on the GPU, so no pixel goes through the CPU.
@@ -67,10 +69,15 @@ ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (
     space), with DE/US labels. A mouse next to it shows left, right and middle click, scroll
     up/down and both side buttons. On Wayland this reads `/dev/input`, which needs the `input`
     group: run `sudo usermod -aG input $USER` once and log in again.
+  - **Controller:** buttons, sticks, triggers and d-pad of any connected gamepad, drawn as an
+    Xbox or a PlayStation controller (the look is a setting, independent of the pad in use).
+    Controllers that are switched on later are picked up automatically.
   - **Webcam:** any V4L2 camera, optionally mirrored.
   - **Website:** any URL (alerts, chat, widgets), rendered by a headless Chromium-based browser
-    (Chromium, Chrome, Brave, Edge, Vivaldi) with a transparent background. An editor shows the
-    page; drag with the mouse to cut out the part that should be visible.
+    (Chromium, Chrome, Brave, Edge, Vivaldi) with a transparent background. Page size, zoom,
+    update rate and custom CSS are set per overlay. The settings show the page live; draw a
+    cut-out with the mouse, move it, or resize it at its edges and corners (or type exact
+    pixels). A page that cannot be reached yet is retried every few seconds.
 - **In-game notifications:** Instant Replay on/off, clip saved (with the real clip length),
   recording started/saved and game detected. They are drawn on a layer-shell overlay surface above
   fullscreen games, never take focus and let clicks through.
