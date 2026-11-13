@@ -1,10 +1,11 @@
-//! Video overlays burned into recordings / replay clips: keyboard & mouse input display, webcam
-//! and websites (rendered by a headless browser). One source per screen corner.
+//! Video overlays burned into recordings / replay clips: keyboard & mouse input display, controller
+//! input display, webcam and websites (rendered by a headless browser). One source per screen corner.
 //!
 //! Every source renders into an [`Image`] (straight-alpha BGRA). Encoders ask the [`OverlayHub`]
 //! for the current [`Layer`]s each frame and composite them – on the GPU with `overlay_vaapi`
 //! (zero-copy path) or in software on the CPU path.
 
+pub mod controller;
 pub mod input;
 pub mod webcam;
 pub mod web;
@@ -37,7 +38,7 @@ impl Slot {
         *self.latest.lock() = None;
         self.version.fetch_add(1, Ordering::Relaxed);
     }
-    fn get(&self) -> Option<(Arc<Image>, u64)> {
+    pub fn get(&self) -> Option<(Arc<Image>, u64)> {
         self.latest.lock().clone().map(|i| (i, self.version.load(Ordering::Relaxed)))
     }
 }
@@ -122,6 +123,7 @@ impl OverlayHub {
                 OverlayKind::Input => input::spawn(sc.input.clone(), slot.clone(), stop.clone()),
                 OverlayKind::Webcam => webcam::spawn(sc.webcam.clone(), slot.clone(), stop.clone()),
                 OverlayKind::Website => web::spawn(sc.website.clone(), slot.clone(), stop.clone()),
+                OverlayKind::Controller => controller::spawn(sc.controller.clone(), slot.clone(), stop.clone()),
             };
             match started {
                 Ok(()) => v.push(Running { corner, cfg: sc, slot, stop }),

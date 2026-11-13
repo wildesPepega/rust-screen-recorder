@@ -552,16 +552,19 @@ pub enum OverlayKind {
     Webcam,
     /// Any web page (alerts, chat, widgets …) rendered by a headless browser.
     Website,
+    /// Gamepad input display.
+    Controller,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 4] = [OverlayKind::None, OverlayKind::Input, OverlayKind::Webcam, OverlayKind::Website];
+    pub const ALL: [OverlayKind; 5] = [OverlayKind::None, OverlayKind::Input, OverlayKind::Controller, OverlayKind::Webcam, OverlayKind::Website];
     pub fn label(self) -> &'static str {
         match self {
             OverlayKind::None => "Empty",
             OverlayKind::Input => "Keyboard & mouse",
             OverlayKind::Webcam => "Webcam",
             OverlayKind::Website => "Website",
+            OverlayKind::Controller => "Controller",
         }
     }
 }
@@ -595,6 +598,25 @@ impl Default for InputOverlay {
     }
 }
 
+/// Which controller is drawn (the buttons light up by position, whatever pad is connected).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControllerModel {
+    Xbox,
+    PlayStation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControllerOverlay {
+    pub model: ControllerModel,
+}
+
+impl Default for ControllerOverlay {
+    fn default() -> Self {
+        Self { model: ControllerModel::Xbox }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebcamOverlay {
@@ -623,11 +645,29 @@ pub struct WebsiteOverlay {
     pub crop_h: u32,
     /// Transparent page background (for alert / chat widgets).
     pub transparent: bool,
+    /// Zoom of the page content in percent (the page size in pixels stays the same).
+    pub zoom_percent: u32,
+    /// Highest update rate of the overlay.
+    pub fps: u32,
+    /// Extra CSS applied to the page (hide elements, change fonts, colours …).
+    pub custom_css: String,
 }
 
 impl Default for WebsiteOverlay {
     fn default() -> Self {
-        Self { url: String::new(), page_width: 1280, page_height: 720, crop_x: 0, crop_y: 0, crop_w: 0, crop_h: 0, transparent: true }
+        Self {
+            url: String::new(),
+            page_width: 1280,
+            page_height: 720,
+            crop_x: 0,
+            crop_y: 0,
+            crop_w: 0,
+            crop_h: 0,
+            transparent: true,
+            zoom_percent: 100,
+            fps: 30,
+            custom_css: String::new(),
+        }
     }
 }
 
@@ -643,6 +683,7 @@ pub struct OverlaySlot {
     pub input: InputOverlay,
     pub webcam: WebcamOverlay,
     pub website: WebsiteOverlay,
+    pub controller: ControllerOverlay,
 }
 
 impl Default for OverlaySlot {
@@ -655,6 +696,7 @@ impl Default for OverlaySlot {
             input: InputOverlay::default(),
             webcam: WebcamOverlay::default(),
             website: WebsiteOverlay::default(),
+            controller: ControllerOverlay::default(),
         }
     }
 }

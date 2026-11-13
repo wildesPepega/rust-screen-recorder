@@ -1,5 +1,7 @@
 //! Website overlay: a headless Chromium-based browser renders the page, frames arrive through the
 //! DevTools protocol (`Page.startScreencast`) as PNGs with a transparent background.
+//!
+//! The same source also feeds the live preview in the settings (with the cut-out switched off).
 
 use super::{Image, Slot};
 use crate::config::WebsiteOverlay;
@@ -52,6 +54,13 @@ pub fn find_browser() -> Option<String> {
     })
 }
 
+/// Trace output for debugging the browser connection (RSR_WEB_DEBUG=1).
+fn trace(msg: impl FnOnce() -> String) {
+    if std::env::var_os("RSR_WEB_DEBUG").is_some() {
+        eprintln!("web overlay: {}", msg());
+    }
+}
+
 struct Browser {
     child: Child,
     dir: PathBuf,
@@ -71,9 +80,20 @@ impl Drop for Browser {
 impl Browser {
     fn launch(cfg: &WebsiteOverlay) -> Result<Browser> {
         let exe = find_browser().ok_or_else(|| anyhow!("no Chromium-based browser found (Chromium, Chrome, Brave, Edge, Vivaldi)"))?;
-        let dir = crate::session::log_dir().join(format!("web-overlay-{}-{}", std::process::id(), rand_suffix()));
+        remove_stale_profiles();
+        let dir = crate::session::log_dir().join(format!("{PROFILE_PREFIX}{}-{}", std::process::id(), rand_suffix()));
         std::fs::create_dir_all(&dir)?;
-        let child = std::process::Command::new(&exe)
+        let mut cmd = std::process::Command::new(&exe);
+        // The browser must never outlive the thread that owns it (daemon crash, overlay closed
+        // while the preview runs): the kernel kills it when this thread exits.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+        let child = cmd
             .args([
                 "--headless=new",
                 "--remote-debugging-port=0",
@@ -82,6 +102,13 @@ impl Browser {
                 "--hide-scrollbars",
                 "--mute-audio",
                 "--disable-extensions",
+                // A throwaway profile: no component downloads, sync or other background traffic,
+                // and no disk cache (these grew every profile to 100+ MB).
+                "--disable-component-update",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-default-apps",
+                "--disk-cache-size=1",
                 "--autoplay-policy=no-user-gesture-required",
                 &format!("--window-size={},{}", cfg.page_width.max(64), cfg.page_height.max(64)),
                 &format!("--user-data-dir={}", dir.display()),
@@ -109,15 +136,44 @@ impl Browser {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        let list: Value = reqwest::blocking::get(format!("http://127.0.0.1:{port}/json/list"))?.json()?;
-        let ws_url = list
-            .as_array()
-            .and_then(|a| a.iter().find(|t| t["type"] == "page"))
-            .and_then(|t| t["webSocketDebuggerUrl"].as_str())
-            .ok_or_else(|| anyhow!("no page target in the browser"))?
-            .to_string();
+        trace(|| format!("{exe} listens on DevTools port {port}"));
+        // Do not touch the tab before it has finished loading: a DevTools connection made too
+        // early (Vivaldi is still attaching the tab to its UI then) leaves the tab dead for good –
+        // it never answers a single command. A loaded tab has a title; the tab list can be read
+        // without connecting to the tab.
+        let ws_url = loop {
+            let list: Value = reqwest::blocking::get(format!("http://127.0.0.1:{port}/json/list"))?.json()?;
+            let tab = list.as_array().and_then(|a| a.iter().find(|t| t["type"] == "page"));
+            if let Some(url) = tab.filter(|t| t["title"].as_str().is_some_and(|s| !s.is_empty())).and_then(|t| t["webSocketDebuggerUrl"].as_str()) {
+                break url.to_string();
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                bail!("the browser did not open a tab");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
         let (ws, _) = tungstenite::connect(ws_url)?;
-        Ok(Browser { child, dir, ws, next_id: 1 })
+        // Reads return regularly so waiting for a message can time out and be stopped.
+        if let MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(READ_TICK))?;
+        }
+        let mut b = Browser { child, dir, ws, next_id: 1 };
+        b.call_within("Runtime.evaluate", json!({ "expression": "1" }), Duration::from_secs(5)).context("the browser tab does not answer")?;
+        trace(|| format!("browser ready after {:.1} s", start.elapsed().as_secs_f32()));
+        Ok(b)
+    }
+
+    /// Next message from the browser; None when nothing arrived within `READ_TICK`.
+    fn read(&mut self) -> Result<Option<Value>> {
+        match self.ws.read() {
+            Ok(Message::Text(t)) => {
+                trace(|| t.chars().take(200).collect());
+                Ok(Some(serde_json::from_str(&t)?))
+            }
+            Ok(_) => Ok(None),
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn send(&mut self, method: &str, params: Value) -> Result<u64> {
@@ -127,62 +183,116 @@ impl Browser {
         Ok(id)
     }
 
-    /// Wait for the reply to `id` (events in between are dropped).
+    /// Send a command and wait for its reply (events in between are dropped).
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call_within(method, params, Duration::from_secs(15))
+    }
+
+    fn call_within(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.send(method, params)?;
-        loop {
-            let msg = self.ws.read()?;
-            if let Message::Text(t) = msg {
-                let v: Value = serde_json::from_str(&t)?;
-                if v["id"].as_u64() == Some(id) {
-                    if let Some(e) = v.get("error") {
-                        bail!("{method}: {e}");
-                    }
-                    return Ok(v["result"].clone());
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let Some(v) = self.read()? else { continue };
+            if v["id"].as_u64() == Some(id) {
+                if let Some(e) = v.get("error") {
+                    bail!("{method}: {e}");
                 }
+                return Ok(v["result"].clone());
             }
         }
+        bail!("the browser did not answer {method}")
     }
 
     /// Wait for a DevTools event (other messages are dropped).
     fn wait_event(&mut self, method: &str, timeout: Duration) -> Result<()> {
-        if let MaybeTlsStream::Plain(s) = self.ws.get_ref() {
-            s.set_read_timeout(Some(Duration::from_millis(250)))?;
-        }
         let start = Instant::now();
-        let r = loop {
-            if start.elapsed() > timeout {
-                break Err(anyhow!("timed out waiting for {method}"));
+        while start.elapsed() < timeout {
+            if self.read()?.is_some_and(|v| v["method"] == method) {
+                return Ok(());
             }
-            match self.ws.read() {
-                Ok(Message::Text(t)) => {
-                    if serde_json::from_str::<Value>(&t).map(|v| v["method"] == method).unwrap_or(false) {
-                        break Ok(());
-                    }
-                }
-                Ok(_) => {}
-                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
-                Err(e) => break Err(e.into()),
-            }
-        };
-        if let MaybeTlsStream::Plain(s) = self.ws.get_ref() {
-            s.set_read_timeout(None)?;
         }
-        r
+        bail!("timed out waiting for {method}")
+    }
+
+    /// Make the page area of the real browser window exactly `w` × `h`. The screencast delivers
+    /// what the window really shows, and some browsers (Vivaldi) put their own UI into the
+    /// window, so `--window-size` alone gives a smaller page than asked for.
+    fn fit_viewport(&mut self, w: u32, h: u32) -> Result<()> {
+        for _ in 0..8 {
+            let r = self.call("Runtime.evaluate", json!({ "expression": "innerWidth + 'x' + innerHeight" }))?;
+            let size = r["result"]["value"].as_str().and_then(|s| s.split_once('x')).and_then(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<i64>().ok()?)));
+            let Some((iw, ih)) = size else { bail!("cannot read the page size") };
+            if (iw, ih) == (w as i64, h as i64) {
+                return Ok(());
+            }
+            let win = self.call("Browser.getWindowForTarget", json!({}))?;
+            let (bw, bh) = (win["bounds"]["width"].as_i64().unwrap_or(w as i64), win["bounds"]["height"].as_i64().unwrap_or(h as i64));
+            let bounds = json!({ "width": (bw + w as i64 - iw).max(64), "height": (bh + h as i64 - ih).max(64) });
+            self.call("Browser.setWindowBounds", json!({ "windowId": win["windowId"], "bounds": bounds }))?;
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        log::warn!("website overlay: the browser window could not be resized to {w}×{h}");
+        Ok(())
     }
 
     fn setup(&mut self, cfg: &WebsiteOverlay) -> Result<()> {
-        self.call(
-            "Emulation.setDeviceMetricsOverride",
-            json!({ "width": cfg.page_width.max(64), "height": cfg.page_height.max(64), "deviceScaleFactor": 1, "mobile": false }),
-        )?;
+        self.fit_viewport(cfg.page_width.max(64), cfg.page_height.max(64))?;
         if cfg.transparent {
             self.call("Emulation.setDefaultBackgroundColorOverride", json!({ "color": { "r": 0, "g": 0, "b": 0, "a": 0 } }))?;
         }
         self.call("Page.enable", json!({}))?;
-        self.call("Page.navigate", json!({ "url": cfg.url }))?;
+        let css = page_css(cfg);
+        if !css.is_empty() {
+            // Runs in every document before its own scripts, so it also survives page reloads.
+            let js = format!(
+                "(() => {{ const css = {}; const add = () => {{ const s = document.createElement('style'); s.textContent = css; \
+                 (document.head || document.documentElement).appendChild(s); }}; \
+                 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add); else add(); }})()",
+                serde_json::to_string(&css)?
+            );
+            self.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": js }))?;
+        }
+        let nav = self.call("Page.navigate", json!({ "url": cfg.url.trim() }))?;
+        if let Some(e) = nav["errorText"].as_str().filter(|e| !e.is_empty()) {
+            bail!("cannot open the page ({e})");
+        }
         Ok(())
     }
+}
+
+const PROFILE_PREFIX: &str = "web-overlay-";
+const READ_TICK: Duration = Duration::from_millis(250);
+/// Pause before a failed overlay (page not reachable, browser crashed) is started again.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// Styles added to the page: the zoom and the user's own CSS.
+fn page_css(cfg: &WebsiteOverlay) -> String {
+    let mut css = String::new();
+    let zoom = cfg.zoom_percent.clamp(25, 400);
+    if zoom != 100 {
+        css.push_str(&format!(":root {{ zoom: {}; }}\n", zoom as f32 / 100.0));
+    }
+    css.push_str(cfg.custom_css.trim());
+    css
+}
+
+/// Delete browser profiles left behind by recorder processes that no longer exist (killed or
+/// crashed before they could clean up).
+fn remove_stale_profiles() {
+    let Ok(rd) = std::fs::read_dir(crate::session::log_dir()) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(pid) = name.strip_prefix(PROFILE_PREFIX).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if !is_recorder_process(pid) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Is `pid` a running rust-screen-recorder (daemon or overlay)? PIDs get reused by other programs.
+fn is_recorder_process(pid: u32) -> bool {
+    let own = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| !own.is_empty() && c == own)
 }
 
 fn rand_suffix() -> u64 {
@@ -206,10 +316,18 @@ fn decode(png_data: &[u8], cfg: &WebsiteOverlay) -> Result<Image> {
     let ch = if cfg.crop_h == 0 { ph - cy } else { cfg.crop_h.min(ph - cy) };
     let mut out = Vec::with_capacity((cw * ch * 4) as usize);
     for y in cy..cy + ch {
-        for x in cx..cx + cw {
-            let i = ((y * pw + x) as usize) * channels;
-            let a = if channels == 4 { buf[i + 3] } else { 255 };
-            out.extend_from_slice(&[buf[i + 2], buf[i + 1], buf[i], a]);
+        let row = &buf[(y * pw + cx) as usize * channels..][..cw as usize * channels];
+        if channels == 4 {
+            // Copy the row in one go, then swap red and blue in place.
+            let start = out.len();
+            out.extend_from_slice(row);
+            for p in out[start..].chunks_exact_mut(4) {
+                p.swap(0, 2);
+            }
+        } else {
+            for p in row.chunks_exact(3) {
+                out.extend_from_slice(&[p[2], p[1], p[0], 255]);
+            }
         }
     }
     Ok(Image { w: cw.max(1), h: ch.max(1), bgra: out })
@@ -220,15 +338,28 @@ pub fn spawn(cfg: WebsiteOverlay, slot: Arc<Slot>, stop: Arc<AtomicBool>) -> Res
         bail!("no URL set");
     }
     std::thread::Builder::new().name("overlay-web".into()).spawn(move || {
-        if let Err(e) = run(&cfg, &slot, &stop) {
-            log::warn!("website overlay {}: {e:#}", cfg.url);
+        // Keep trying: the page may belong to a program that is started later (alert/chat tools).
+        let mut last_error = String::new();
+        while !stop.load(Ordering::SeqCst) {
+            if let Err(e) = run(&cfg, &slot, &stop) {
+                let e = format!("{e:#}");
+                if e != last_error {
+                    log::warn!("website overlay {}: {e} – retrying every {} s", cfg.url, RETRY_AFTER.as_secs());
+                    last_error = e;
+                }
+            }
+            slot.clear();
+            let wait = Instant::now();
+            while wait.elapsed() < RETRY_AFTER && !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
-        slot.clear();
     })?;
     Ok(())
 }
 
-fn run(cfg: &WebsiteOverlay, slot: &Slot, stop: &AtomicBool) -> Result<()> {
+/// Render the page into `slot` until `stop` is set (blocking). Also used by the settings preview.
+pub fn run(cfg: &WebsiteOverlay, slot: &Slot, stop: &AtomicBool) -> Result<()> {
     let mut b = Browser::launch(cfg)?;
     b.setup(cfg)?;
     // Screencasting only works once the navigated page is attached: wait for its load event.
@@ -242,27 +373,16 @@ fn run(cfg: &WebsiteOverlay, slot: &Slot, stop: &AtomicBool) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
-    if let MaybeTlsStream::Plain(s) = b.ws.get_ref() {
-        s.set_read_timeout(Some(Duration::from_millis(500)))?;
-    }
+    let min_gap = Duration::from_secs_f64(1.0 / cfg.fps.clamp(1, 60) as f64) - Duration::from_millis(2);
     let mut last = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::SeqCst) {
-        let msg = match b.ws.read() {
-            Ok(m) => m,
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
-            Err(e) => return Err(e.into()),
-        };
-        let Message::Text(t) = msg else { continue };
-        let v: Value = serde_json::from_str(&t)?;
-        if std::env::var_os("RSR_WEB_DEBUG").is_some() {
-            eprintln!("cdp: {}", &t.chars().take(160).collect::<String>());
-        }
+        let Some(v) = b.read()? else { continue };
         if v["method"] == "Page.screencastFrame" {
             let p = &v["params"];
             let session = p["sessionId"].clone();
             b.send("Page.screencastFrameAck", json!({ "sessionId": session }))?;
-            // At most ~30 fps.
-            if last.elapsed() < Duration::from_millis(33) {
+            // The browser sends a frame whenever the page changes; drop what exceeds the limit.
+            if last.elapsed() < min_gap {
                 continue;
             }
             last = Instant::now();
@@ -278,32 +398,52 @@ fn run(cfg: &WebsiteOverlay, slot: &Slot, stop: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-/// One screenshot of the whole page (for the crop editor in the settings).
-pub fn screenshot(cfg: &WebsiteOverlay) -> Result<Image> {
-    let mut b = Browser::launch(cfg)?;
-    b.setup(cfg)?;
-    let _ = b.wait_event("Page.loadEventFired", Duration::from_secs(15));
-    std::thread::sleep(Duration::from_millis(1200)); // let the page animate in
-    let r = b.call("Page.captureScreenshot", json!({ "format": "png" }))?;
-    let data = r["data"].as_str().ok_or_else(|| anyhow!("no screenshot data"))?;
-    let png_data = base64::engine::general_purpose::STANDARD.decode(data)?;
-    let full = WebsiteOverlay { crop_x: 0, crop_y: 0, crop_w: 0, crop_h: 0, ..cfg.clone() };
-    decode(&png_data, &full)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     /// RSR_WEB_TEST=file:///path/page.html cargo test web_overlay -- --nocapture
     #[test]
+    fn page_css_combines_zoom_and_custom_css() {
+        assert_eq!(page_css(&WebsiteOverlay::default()), "");
+        let cfg = WebsiteOverlay { zoom_percent: 150, custom_css: " .ad { display: none } ".into(), ..Default::default() };
+        assert_eq!(page_css(&cfg), ":root { zoom: 1.5; }\n.ad { display: none }");
+    }
+
+    #[test]
+    fn crop_keeps_the_chosen_part() {
+        // 3 × 2 page: pixel value = index, RGBA.
+        let mut data = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut data, 3, 2);
+            enc.set_color(png::ColorType::Rgba);
+            let px: Vec<u8> = (0..6u8).flat_map(|i| [i, 100 + i, 200 + i, 255]).collect();
+            enc.write_header().unwrap().write_image_data(&px).unwrap();
+        }
+        let cfg = WebsiteOverlay { crop_x: 1, crop_y: 1, crop_w: 2, crop_h: 1, ..Default::default() };
+        let img = decode(&data, &cfg).unwrap();
+        assert_eq!((img.w, img.h), (2, 1));
+        // Pixels 4 and 5, as BGRA.
+        assert_eq!(img.bgra, vec![204, 104, 4, 255, 205, 105, 5, 255]);
+        // No cut-out = whole page.
+        assert_eq!(decode(&data, &WebsiteOverlay::default()).unwrap().bgra.len(), 6 * 4);
+    }
+
+    #[test]
     fn web_overlay() {
         let Ok(url) = std::env::var("RSR_WEB_TEST") else { return };
-        let cfg = WebsiteOverlay { url, page_width: 900, page_height: 200, ..Default::default() };
-        let shot = screenshot(&cfg).expect("screenshot");
-        eprintln!("screenshot {}x{}", shot.w, shot.h);
+        let zoom_percent = std::env::var("RSR_WEB_ZOOM").ok().and_then(|z| z.parse().ok()).unwrap_or(100);
+        let custom_css = std::env::var("RSR_WEB_CSS").unwrap_or_default();
+        let cfg = WebsiteOverlay { url, page_width: 900, page_height: 200, zoom_percent, custom_css, ..Default::default() };
         let slot = Arc::new(Slot::default());
         let stop = Arc::new(AtomicBool::new(false));
-        spawn(cfg, slot.clone(), stop.clone()).unwrap();
+        {
+            let (slot, stop) = (slot.clone(), stop.clone());
+            std::thread::spawn(move || {
+                if let Err(e) = run(&cfg, &slot, &stop) {
+                    eprintln!("website overlay failed: {e:#}");
+                }
+            });
+        }
         let t = Instant::now();
         let mut frames = 0;
         let mut last = 0;
@@ -320,6 +460,13 @@ mod tests {
         if let Some((img, _)) = slot.get() {
             let opaque = img.bgra.chunks(4).filter(|p| p[3] > 200).count();
             eprintln!("last frame {}x{}, opaque pixels {opaque} of {}", img.w, img.h, img.w * img.h);
+            if let Some(out) = std::env::var_os("RSR_WEB_OUT") {
+                let mut rgba = img.bgra.clone();
+                rgba.chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+                let mut enc = png::Encoder::new(std::fs::File::create(out).unwrap(), img.w, img.h);
+                enc.set_color(png::ColorType::Rgba);
+                enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            }
         }
         assert!(frames > 3);
     }

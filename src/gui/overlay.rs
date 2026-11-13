@@ -117,6 +117,7 @@ impl Overlay {
     }
 
     fn close_panel(&mut self) {
+        self.editor.stop_previews();
         self.panel = None;
         self.cfg = Config::load();
         self.opened = Instant::now() - Duration::from_secs_f32(SLIDE * 0.4); // quick re-entry of tiles
