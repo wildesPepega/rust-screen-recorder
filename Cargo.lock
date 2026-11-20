@@ -3401,7 +3401,7 @@ dependencies = [
 
 [[package]]
 name = "rust-screen-recorder"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
