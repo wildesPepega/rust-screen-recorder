@@ -3433,6 +3433,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+ "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "wayland-scanner",
  "xxhash-rust",

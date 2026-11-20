@@ -609,11 +609,15 @@ pub enum ControllerModel {
 #[serde(default)]
 pub struct ControllerOverlay {
     pub model: ControllerModel,
+    /// Only show the controller while it is being used.
+    pub auto_hide: bool,
+    /// Seconds without input before it fades out (with `auto_hide`).
+    pub hide_after_secs: u32,
 }
 
 impl Default for ControllerOverlay {
     fn default() -> Self {
-        Self { model: ControllerModel::Xbox }
+        Self { model: ControllerModel::Xbox, auto_hide: true, hide_after_secs: 5 }
     }
 }
 

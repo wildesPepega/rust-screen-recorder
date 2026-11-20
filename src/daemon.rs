@@ -397,6 +397,7 @@ impl Daemon {
                         }
                     }
                     Err(e) => {
+                        log::error!("saving the clip failed: {e}");
                         self.last_message = format!("Saving failed: {e}");
                         self.notify(ToastKind::Error, "Saving the clip failed", &e).await;
                     }
@@ -807,13 +808,9 @@ impl Daemon {
                 let tx = self.tx.clone();
                 let what = game.unwrap_or_else(|| "Desktop".into());
                 tokio::task::spawn_blocking(move || {
-                    let r = job
-                        .run()
-                        .map(|p| {
-                            let secs = session::probe_duration(&p).unwrap_or(0.0);
-                            (p, secs, what)
-                        })
-                        .map_err(|e| format!("{e:#}"));
+                    let t = std::time::Instant::now();
+                    let r = job.run().map(|(p, secs)| (p, secs, what)).map_err(|e| format!("{e:#}"));
+                    log::info!("clip saved in {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
                     let _ = tx.send(Event::SaveDone(r));
                 });
             }

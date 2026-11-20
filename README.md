@@ -33,9 +33,10 @@ ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (
   library (Steam appmanifest / non-Steam shortcuts, Lutris `GAME_NAME`, Heroic library cache,
   Faugus `games.json`).
 - **Instant replay** with a RAM (`/dev/shm`) or disk ring buffer. Saving is a lossless concat of
-  2 s segments. The clip ends at the moment you press the key (the recorder waits for the running
-  segment to be finished, at most 2 s) and is exactly as long as configured in MP4/MOV; other
-  containers start at the previous keyframe and can be up to one keyframe interval longer.
+  2 s segments and is done about 0.3 s after the key press (H.264/HEVC with AAC/Opus; with FLAC
+  audio or AV1 it waits for the running segment, up to 2 s). The clip ends at the moment you press
+  the key and is exactly as long as configured in MP4/MOV; other containers start at the previous
+  keyframe and can be up to one keyframe interval longer.
 - **Recording** with its own codec, preset and output folder, separate from instant replay.
 - **Zero-copy GPU pipeline (VA-API, AMD/Intel):** KWin hands out DMA-BUFs. They are imported into
   VA-API, then colour-converted, scaled and encoded on the GPU, so no pixel goes through the CPU.
@@ -71,7 +72,8 @@ ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (
     group: run `sudo usermod -aG input $USER` once and log in again.
   - **Controller:** buttons, sticks, triggers and d-pad of any connected gamepad, drawn as an
     Xbox or a PlayStation controller (the look is a setting, independent of the pad in use).
-    Controllers that are switched on later are picked up automatically.
+    Controllers that are switched on later are picked up automatically. By default it is only
+    shown while the controller is used and fades out after 5 s without input (adjustable).
   - **Webcam:** any V4L2 camera, optionally mirrored.
   - **Website:** any URL (alerts, chat, widgets), rendered by a headless Chromium-based browser
     (Chromium, Chrome, Brave, Edge, Vivaldi) with a transparent background. Page size, zoom,
@@ -80,7 +82,8 @@ ShadowPlay-style instant replay, recording and game capture for **KDE Plasma 6 (
     pixels). A page that cannot be reached yet is retried every few seconds.
 - **In-game notifications:** Instant Replay on/off, clip saved (with the real clip length),
   recording started/saved and game detected. They are drawn on a layer-shell overlay surface above
-  fullscreen games, never take focus and let clicks through.
+  fullscreen games, never take focus and let clicks through, and always appear on the primary
+  monitor (top right).
 - **Overlay** (Alt+Z) is the whole UI; there is no separate settings window. Every setting exists
   in exactly one place: the Replay and Recording tiles have ⚙ for their own settings, the
   Capture tile holds the capture mode, and **⚙ Global Settings** (top right) holds General

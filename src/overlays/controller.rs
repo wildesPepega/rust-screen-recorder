@@ -25,6 +25,10 @@ const H: f32 = 384.0;
 const RESCAN: Duration = Duration::from_secs(3);
 /// Stick movement below this is noise (drift) and not worth a redraw.
 const DEADZONE: f32 = 0.06;
+/// A stick or trigger counts as "in use" beyond this (drift and resting triggers stay below).
+const ACTIVE: f32 = 0.2;
+/// Fade in / out time of the auto-hide.
+const FADE: Duration = Duration::from_millis(250);
 
 /// Buttons by their *position* on the controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,6 +189,24 @@ impl PadState {
             || far(self.lt, other.lt)
             || far(self.rt, other.rt)
     }
+
+    /// Is the controller being held in a non-resting position (button down, stick pushed, …)?
+    fn in_use(&self) -> bool {
+        !self.pressed.is_empty()
+            || [self.lx, self.ly, self.rx, self.ry].iter().any(|v| v.abs() > ACTIVE)
+            || self.lt > ACTIVE
+            || self.rt > ACTIVE
+    }
+}
+
+/// Multiply a premultiplied pixmap with `alpha` (fade).
+fn fade(pm: &mut Pixmap, alpha: f32) {
+    if alpha >= 1.0 {
+        return;
+    }
+    for v in pm.data_mut() {
+        *v = (*v as f32 * alpha).round() as u8;
+    }
 }
 
 fn is_gamepad(dev: &evdev::Device) -> bool {
@@ -194,17 +216,40 @@ fn is_gamepad(dev: &evdev::Device) -> bool {
 pub fn spawn(cfg: ControllerOverlay, slot: Arc<Slot>, stop: Arc<AtomicBool>) -> Result<()> {
     let fonts = Fonts::load()?;
     let state = Arc::new(Mutex::new(PadState::default()));
+    // Last time the controller was used (input that is not stick drift).
+    let used: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     {
-        let (state, stop) = (state.clone(), stop.clone());
-        std::thread::Builder::new().name("overlay-pad-scan".into()).spawn(move || scan_loop(state, stop))?;
+        let (state, used, stop) = (state.clone(), used.clone(), stop.clone());
+        std::thread::Builder::new().name("overlay-pad-scan".into()).spawn(move || scan_loop(state, used, stop))?;
     }
+    let hide_after = Duration::from_secs(cfg.hide_after_secs.max(1) as u64);
     std::thread::Builder::new().name("overlay-pad".into()).spawn(move || {
-        let mut drawn: Option<PadState> = None;
+        let mut drawn: Option<(PadState, f32)> = None;
+        let mut alpha: f32 = if cfg.auto_hide { 0.0 } else { 1.0 };
+        let mut last = Instant::now();
         while !stop.load(Ordering::SeqCst) {
             let s = state.lock().clone();
-            if drawn.as_ref().is_none_or(|d| d.differs(&s)) {
-                slot.put(image_from_pixmap(render(&cfg, &s, &fonts)));
-                drawn = Some(s);
+            let dt = last.elapsed().as_secs_f32();
+            last = Instant::now();
+            if cfg.auto_hide {
+                let shown = s.in_use() || used.lock().is_some_and(|t| t.elapsed() < hide_after);
+                let step = dt / FADE.as_secs_f32();
+                alpha = if shown { (alpha + step).min(1.0) } else { (alpha - step).max(0.0) };
+            }
+            let a = (alpha * 10.0).round() / 10.0; // ~10 fade steps
+            let changed = match &drawn {
+                None => true,
+                Some((d, da)) => (da - a).abs() > 0.01 || (a > 0.0 && d.differs(&s)),
+            };
+            if changed {
+                if a <= 0.0 {
+                    slot.clear();
+                } else {
+                    let mut pm = render(&cfg, &s, &fonts);
+                    fade(&mut pm, a);
+                    slot.put(image_from_pixmap(pm));
+                }
+                drawn = Some((s, a));
             }
             std::thread::sleep(Duration::from_millis(16));
         }
@@ -214,7 +259,7 @@ pub fn spawn(cfg: ControllerOverlay, slot: Arc<Slot>, stop: Arc<AtomicBool>) -> 
 }
 
 /// Open every gamepad in /dev/input, also the ones that are connected later.
-fn scan_loop(state: Arc<Mutex<PadState>>, stop: Arc<AtomicBool>) {
+fn scan_loop(state: Arc<Mutex<PadState>>, used: Arc<Mutex<Option<Instant>>>, stop: Arc<AtomicBool>) {
     // Device nodes that were already looked at (gamepad or not).
     let mut known: HashSet<PathBuf> = HashSet::new();
     let mut next = Instant::now();
@@ -238,13 +283,13 @@ fn scan_loop(state: Arc<Mutex<PadState>>, stop: Arc<AtomicBool>) {
                 continue;
             }
             log::info!("controller overlay: reading {} ({})", dev.name().unwrap_or("gamepad"), path.display());
-            let (state, stop) = (state.clone(), stop.clone());
-            let _ = std::thread::Builder::new().name("overlay-pad-dev".into()).spawn(move || read_device(dev, state, stop));
+            let (state, used, stop) = (state.clone(), used.clone(), stop.clone());
+            let _ = std::thread::Builder::new().name("overlay-pad-dev".into()).spawn(move || read_device(dev, state, used, stop));
         }
     }
 }
 
-fn read_device(mut dev: evdev::Device, state: Arc<Mutex<PadState>>, stop: Arc<AtomicBool>) {
+fn read_device(mut dev: evdev::Device, state: Arc<Mutex<PadState>>, used: Arc<Mutex<Option<Instant>>>, stop: Arc<AtomicBool>) {
     let map = PadMap::from_device(&dev);
     let fd = dev.as_raw_fd();
     while !stop.load(Ordering::SeqCst) {
@@ -254,12 +299,20 @@ fn read_device(mut dev: evdev::Device, state: Arc<Mutex<PadState>>, stop: Arc<At
         }
         let Ok(events) = dev.fetch_events() else { break };
         let mut s = state.lock();
+        let mut active = false;
         for ev in events {
             match ev.destructure() {
-                EventSummary::Key(_, code, v) if v == 0 || v == 1 => s.key(&map, code, v == 1),
+                EventSummary::Key(_, code, v) if v == 0 || v == 1 => {
+                    s.key(&map, code, v == 1);
+                    active = true;
+                }
                 EventSummary::AbsoluteAxis(_, axis, v) => s.axis(&map, axis, v),
                 _ => {}
             }
+        }
+        // Sticks and triggers only count when they are really moved, not for drift.
+        if active || s.in_use() {
+            *used.lock() = Some(Instant::now());
         }
     }
     // Unplugged: nothing stays "pressed".
@@ -621,6 +674,27 @@ fn sample_state() -> PadState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn drift_is_not_use_but_buttons_sticks_and_triggers_are() {
+        let rest = PadState { lx: 0.05, ly: -0.08, rx: 0.1, ry: 0.0, lt: 0.02, ..Default::default() };
+        assert!(!rest.in_use());
+        assert!(PadState { lx: 0.7, ..Default::default() }.in_use());
+        assert!(PadState { rt: 0.5, ..Default::default() }.in_use());
+        let mut b = PadState::default();
+        b.pressed.insert(Btn::South);
+        assert!(b.in_use());
+    }
+
+    #[test]
+    fn fade_scales_premultiplied_pixels() {
+        let mut pm = Pixmap::new(1, 1).unwrap();
+        pm.fill(Color::from_rgba8(200, 100, 50, 255));
+        fade(&mut pm, 0.5);
+        assert_eq!(pm.data(), &[100, 50, 25, 128]);
+        fade(&mut pm, 1.0);
+        assert_eq!(pm.data(), &[100, 50, 25, 128]);
+    }
+
     fn xbox_map() -> PadMap {
         let mut ranges = HashMap::new();
         for a in [Abs::ABS_X, Abs::ABS_Y, Abs::ABS_RX, Abs::ABS_RY] {
@@ -710,7 +784,7 @@ mod tests {
         busy.ry = 1.0;
         busy.lt = 1.0;
         for (name, model) in [("xbox", ControllerModel::Xbox), ("playstation", ControllerModel::PlayStation)] {
-            let cfg = ControllerOverlay { model };
+            let cfg = ControllerOverlay { model, ..Default::default() };
             for (state, s) in [("idle", PadState::default()), ("sample", sample_state()), ("busy", busy.clone())] {
                 render(&cfg, &s, &fonts).save_png(std::path::Path::new(&dir).join(format!("pad_{name}_{state}.png"))).unwrap();
             }

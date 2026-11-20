@@ -107,6 +107,11 @@ impl EncoderSession {
                     "-f", "segment", "-segment_time", &format!("{seg_secs}"), "-segment_format", fmt,
                     "-reset_timestamps", "0",
                 ]);
+                if fmt == "mpegts" {
+                    // Write every packet through at once instead of in 256 KiB blocks: a clip can
+                    // then be cut from the running segment without waiting for it to finish.
+                    cmd.args(["-segment_format_options", "flush_packets=1"]);
+                }
                 cmd.arg(dir.join(format!("seg_%08d.{ext}")));
             }
         }
@@ -409,6 +414,7 @@ impl ReplaySession {
             None => press - self.enc.started.elapsed().as_secs_f64(),
         };
         let plan = plan_clip(&closes, first_start, press, self.duration_secs as f64);
+        let pending_start = closes.last().copied().unwrap_or(first_start);
         // Hard-link (or copy) the segments so the ring buffer can keep rotating while we mux.
         let tmp = self.dir.join(format!("save-{}", chrono::Local::now().format("%H%M%S%3f")));
         std::fs::create_dir_all(&tmp)?;
@@ -419,6 +425,7 @@ impl ReplaySession {
         Ok(SaveJob {
             files,
             pending: current.clone(),
+            pending_needed: (press - pending_start).max(0.0),
             dir: self.dir.clone(),
             offset: plan.offset,
             duration: plan.duration,
@@ -488,6 +495,8 @@ pub struct SaveJob {
     files: Vec<PathBuf>,
     /// The segment that was still being written when the clip was requested.
     pending: PathBuf,
+    /// How many seconds of `pending` the clip needs (time from its start to the key press).
+    pending_needed: f64,
     /// The ring buffer directory.
     dir: PathBuf,
     /// Seconds to skip at the start of the first segment.
@@ -501,11 +510,12 @@ pub struct SaveJob {
 }
 
 impl SaveJob {
-    /// Concatenate the segments without re-encoding (blocking; waits for the running segment).
-    pub fn run(mut self) -> Result<PathBuf> {
+    /// Concatenate the segments without re-encoding (blocking; waits for the running segment
+    /// to contain the key press). Returns the file and the clip length in seconds.
+    pub fn run(mut self) -> Result<(PathBuf, f64)> {
         let r = self.run_inner();
         let _ = std::fs::remove_dir_all(&self.tmp);
-        r
+        r.map(|p| (p, self.duration))
     }
 
     /// Wait until FFmpeg has finished the segment that was being written (it is closed before
@@ -524,8 +534,52 @@ impl SaveJob {
         }
     }
 
+    /// MPEG-TS only: copy the running segment as soon as it reaches the key press (plus a little
+    /// slack so the audio, which is muxed slightly behind the video, is complete as well). The
+    /// copy ends right before the newest video frame, which may still be half written.
+    /// Returns None when the segment finished first or nothing usable arrived in time.
+    fn cut_pending(&self) -> Option<PathBuf> {
+        use std::io::Read;
+        const SLACK: f64 = 0.25;
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs_f32(SEGMENT_SECS * 3.0);
+        let mut f = std::fs::File::open(&self.pending).ok()?;
+        let mut data = vec![];
+        let mut scan = TsScan::default();
+        loop {
+            f.read_to_end(&mut data).ok()?;
+            scan.feed(&data);
+            if let (Some(first), Some((last, cut))) = (scan.first_pts, scan.last) {
+                let have = (last.wrapping_sub(first) & PTS_MASK) as f64 / 90_000.0;
+                if have >= self.pending_needed + SLACK {
+                    let dst = self.tmp.join(self.pending.file_name()?);
+                    std::fs::write(&dst, &data[..cut]).ok()?;
+                    log::info!("clip: cut the running segment after {:.0} ms ({have:.2} s of it)", started.elapsed().as_secs_f64() * 1000.0);
+                    return Some(dst);
+                }
+            }
+            let finished = list_segments(&self.dir).last().map(|p| p != &self.pending).unwrap_or(true);
+            if finished || Instant::now() > deadline {
+                log::info!(
+                    "clip: running segment {} after {:.0} ms (needed {:.2} s, pts {:?}/{:?})",
+                    if finished { "finished first" } else { "timed out" },
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    self.pending_needed,
+                    scan.first_pts,
+                    scan.last,
+                );
+                return None;
+            }
+            // read_to_end stops at EOF; the next call continues from there.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn run_inner(&mut self) -> Result<PathBuf> {
-        if self.wait_for_pending() {
+        let ts = self.pending.extension().is_some_and(|e| e == "ts");
+        if let Some(f) = ts.then(|| self.cut_pending()).flatten() {
+            self.files.push(f);
+        } else if self.wait_for_pending() {
             let f = link_into(&self.pending, &self.tmp)?;
             self.files.push(f);
         } else {
@@ -537,12 +591,6 @@ impl SaveJob {
         if let Some(d) = self.out.parent() {
             std::fs::create_dir_all(d)?;
         }
-        let list = self.tmp.join("list.txt");
-        let mut s = String::new();
-        for f in &self.files {
-            s.push_str(&format!("file '{}'\n", f.display().to_string().replace('\'', "'\\''")));
-        }
-        std::fs::write(&list, s)?;
         let mut cmd = encoders::ffmpeg_cmd();
         cmd.args(["-loglevel", "error", "-y"]);
         // Video can only be cut at keyframes without re-encoding. MP4/MOV get the frames between
@@ -553,8 +601,23 @@ impl SaveJob {
         if exact_start {
             cmd.args(["-itsoffset", &format!("-{:.3}", self.offset)]);
         }
-        cmd.args(["-f", "concat", "-safe", "0", "-i"]);
-        cmd.arg(&list);
+        if ts {
+            // MPEG-TS segments are byte-wise continuous: read them as one stream. ~10x faster
+            // than the concat demuxer, which opens and probes every segment on its own.
+            // Relative names (run inside `tmp`), so no path character can break the list.
+            let names: Vec<String> = self.files.iter().filter_map(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+            cmd.current_dir(&self.tmp);
+            cmd.arg("-i").arg(format!("concat:{}", names.join("|")));
+        } else {
+            let list = self.tmp.join("list.txt");
+            let mut s = String::new();
+            for f in &self.files {
+                s.push_str(&format!("file '{}'\n", f.display().to_string().replace('\'', "'\\''")));
+            }
+            std::fs::write(&list, s)?;
+            cmd.args(["-f", "concat", "-safe", "0", "-i"]);
+            cmd.arg(&list);
+        }
         cmd.args(["-map", "0", "-c", "copy"]);
         let length = if exact_start {
             self.duration
@@ -568,7 +631,8 @@ impl SaveJob {
             cmd.arg(format!("-metadata:s:a:{i}")).arg(format!("title={t}"));
             cmd.arg(format!("-metadata:s:a:{i}")).arg(format!("handler_name={t}"));
         }
-        cmd.arg(&self.out);
+        let out = if self.out.is_absolute() { self.out.clone() } else { std::env::current_dir()?.join(&self.out) };
+        cmd.arg(&out);
         let o = cmd.stdin(Stdio::null()).output()?;
         if !o.status.success() {
             return Err(anyhow!("ffmpeg concat failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
@@ -577,14 +641,44 @@ impl SaveJob {
     }
 }
 
-/// Duration of a media file in seconds (via ffprobe).
-pub fn probe_duration(p: &Path) -> Option<f64> {
-    let o = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
-        .arg(p)
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+const PTS_MASK: u64 = (1 << 33) - 1;
+
+/// Incremental MPEG-TS scan for the timestamps of video PES packets.
+#[derive(Default)]
+struct TsScan {
+    /// Bytes already scanned (always a multiple of 188).
+    pos: usize,
+    first_pts: Option<u64>,
+    /// PTS of the newest video frame and the offset of the TS packet it starts in.
+    last: Option<(u64, usize)>,
+}
+
+impl TsScan {
+    fn feed(&mut self, data: &[u8]) {
+        while self.pos + 188 <= data.len() {
+            let pkt = &data[self.pos..self.pos + 188];
+            if pkt[0] != 0x47 {
+                return; // out of sync – leave first/last as they are
+            }
+            let unit_start = pkt[1] & 0x40 != 0;
+            let afc = (pkt[3] >> 4) & 3;
+            let payload = match afc {
+                1 => 4,
+                3 => 5 + pkt[4] as usize,
+                _ => 188,
+            };
+            if unit_start && payload + 14 <= 188 {
+                let pes = &pkt[payload..];
+                if pes[..3] == [0, 0, 1] && (0xE0..=0xEF).contains(&pes[3]) && pes[7] & 0x80 != 0 {
+                    let b = &pes[9..14];
+                    let pts = ((b[0] as u64 >> 1) & 7) << 30 | (b[1] as u64) << 22 | ((b[2] as u64) >> 1) << 15 | (b[3] as u64) << 7 | (b[4] as u64) >> 1;
+                    self.first_pts.get_or_insert(pts);
+                    self.last = Some((pts, self.pos));
+                }
+            }
+            self.pos += 188;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -628,6 +722,34 @@ mod tests {
         // No finished segment at all yet.
         let p = plan_clip(&[], 100.0, 101.0, 60.0);
         assert_eq!(p, ClipPlan { first: 0, offset: 0.0, duration: 1.0 });
+    }
+
+    #[test]
+    fn ts_scan_finds_video_timestamps() {
+        let dir = std::env::temp_dir().join(format!("rsr-ts-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.ts");
+        let ok = encoders::ffmpeg_cmd()
+            .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=3", "-f", "lavfi", "-i", "sine=d=3"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-f", "mpegts"])
+            .arg(&f)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return; // no ffmpeg/libx264 here
+        }
+        let data = std::fs::read(&f).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Fed in uneven pieces, like a file that is still growing.
+        let mut scan = TsScan::default();
+        for end in [1000, 50_000, data.len()] {
+            scan.feed(&data[..end.min(data.len())]);
+        }
+        let (first, (last, cut)) = (scan.first_pts.unwrap(), scan.last.unwrap());
+        let span = (last - first) as f64 / 90_000.0;
+        assert!((span - (3.0 - 1.0 / 30.0)).abs() < 0.01, "span {span}");
+        assert_eq!(cut % 188, 0);
+        assert!(cut < data.len());
     }
 
     #[test]

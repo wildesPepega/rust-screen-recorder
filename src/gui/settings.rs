@@ -1062,6 +1062,16 @@ impl SettingsEditor {
                         ui.radio_value(&mut slot.controller.model, ControllerModel::PlayStation, "PlayStation");
                     });
                     ui.end_row();
+                    ui.label("Auto-hide");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut slot.controller.auto_hide, "Only show while the controller is used");
+                        ui.add_enabled(
+                            slot.controller.auto_hide,
+                            egui::DragValue::new(&mut slot.controller.hide_after_secs).range(1..=60).suffix(" s"),
+                        )
+                        .on_hover_text("Fades out after this long without input");
+                    });
+                    ui.end_row();
                 });
                 ui.label(
                     RichText::new("Shows buttons, sticks and triggers of any connected controller. The model only changes the look – a PlayStation pad can be shown as an Xbox controller and the other way round.")
